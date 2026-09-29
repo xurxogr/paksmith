@@ -877,18 +877,57 @@ impl Package {
                 // is a later phase; until then unversioned typed-class
                 // exports parse as `Generic`.)
                 let mut export_cur = Cursor::new(export_slice);
-                // NOTE: a schema-parse failure here propagates (no Opaque
-                // fallback) — an unversioned parse error usually signals a
-                // wrong/mismatched `.usmap`, which should fail loudly
-                // rather than silently degrade.
-                let props = read_unversioned_properties(
+                // A schema-parse failure degrades THIS export to
+                // `PropertyBag::Opaque` (warn-level) instead of failing the
+                // whole package, mirroring the versioned path in
+                // `read_payloads`. Blueprint packages routinely carry
+                // engine components whose structs are natively serialised
+                // (e.g. `NiagaraComponent.OverrideParameters`, an
+                // `FNiagaraParameterStore`) and therefore cannot be decoded
+                // from the usmap schema; losing one such component must not
+                // hide the CDO and every other export. Only an allocation
+                // failure — an environmental error, not a corrupt export —
+                // still propagates.
+                let props = match read_unversioned_properties(
                     &mut export_cur,
                     &class_name,
                     usmap,
                     &ctx,
                     asset_path,
                     0,
-                )?;
+                ) {
+                    Ok(props) => props,
+                    Err(err)
+                        if matches!(
+                            &err,
+                            PaksmithError::AssetParse {
+                                fault: AssetParseFault::AllocationFailed { .. },
+                                ..
+                            }
+                        ) =>
+                    {
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            asset = asset_path,
+                            export = %export.object_name,
+                            export.class = &*class_name,
+                            error = %err,
+                            "unversioned property decode failed, falling back to Opaque"
+                        );
+                        let mut buf: Vec<u8> = Vec::new();
+                        try_reserve_asset(
+                            &mut buf,
+                            export_slice.len(),
+                            asset_path,
+                            AssetSeam::ExportPayloadBytes,
+                        )?;
+                        buf.extend_from_slice(export_slice);
+                        payloads.push(super::Asset::Generic(PropertyBag::opaque(buf)));
+                        continue;
+                    }
+                };
                 if &*class_name == "DataTable" {
                     // PROTOTYPE (anvil): typed DataTable rows for unversioned packages.
                     let dt = crate::asset::exports::data_table::read_rows_unversioned(

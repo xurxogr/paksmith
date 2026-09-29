@@ -279,6 +279,17 @@ pub(crate) fn read_unversioned_properties(
 
     let all_props = usmap.get_all_properties(class_name);
     if all_props.is_empty() {
+        // A struct that IS in the .usmap but declares no properties
+        // (e.g. `PointerToUberGraphFrame`, the transient frame pointer
+        // every Blueprint CDO carries) occupies zero bytes on the wire:
+        // `SerializeUnversionedProperties` writes no header for a
+        // struct without serialisable members. Emit an empty bag and
+        // leave the cursor where it is — verified against Anvil's
+        // BPVis* CDOs, where the properties after `UberGraphFrame`
+        // decode correctly only with this zero-width treatment.
+        if usmap.schemas.contains_key(class_name) {
+            return Ok(Vec::new());
+        }
         // At depth 0 the export simply has no schema — log and emit an
         // empty bag (the outermost class lookup may resolve to `""` for
         // `PackageIndex::Null`, which we treat as "skip this export"
