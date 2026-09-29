@@ -662,7 +662,8 @@ impl Package {
         let stitched: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
         let bytes: &[u8] = &stitched;
         let mut cursor = Cursor::new(bytes);
-        let summary = PackageSummary::read_from_with_hint(&mut cursor, asset_path, opts.engine_version_hint)?;
+        let summary =
+            PackageSummary::read_from_with_hint(&mut cursor, asset_path, opts.engine_version_hint)?;
 
         // UE 5.2+ object data-resource table (#642). When populated, it
         // governs bulk resolution package-wide: every `FByteBulkData`
@@ -847,7 +848,8 @@ impl Package {
                 asset_path,
                 AssetSeam::ExportPayloads,
             )?;
-            for export in &exports.exports {
+            let mut bulk_records: ExportBulkRecords = Vec::new();
+            for (export_idx, export) in exports.exports.iter().enumerate() {
                 // Propagate OOB errors here rather than swallowing them
                 // with `unwrap_or_default()`. `PackageIndex::Null`
                 // resolves to an empty name, so null class refs flow
@@ -897,14 +899,25 @@ impl Package {
                         asset_path,
                     )?;
                     payloads.push(super::Asset::DataTable(dt));
+                } else if let Some(kind) = texture_kind_for_class(&class_name) {
+                    let total_len = export_slice.len() as u64;
+                    let (data, records) = crate::asset::exports::texture::texture2d::read_tail(
+                        &mut export_cur,
+                        total_len,
+                        &ctx,
+                        asset_path,
+                        kind,
+                        props,
+                    )?;
+                    payloads.push(super::Asset::Texture2D(data));
+                    if !records.is_empty() {
+                        bulk_records.push((export_idx, records));
+                    }
                 } else {
                     payloads.push(super::Asset::Generic(PropertyBag::tree(props)));
                 }
             }
-            // Unversioned bodies never reach typed dispatch (they're
-            // schema-serialized, not tagged), so they surface no bulk
-            // records.
-            (payloads, Vec::new())
+            (payloads, bulk_records)
         } else {
             read_payloads(bytes, &exports, &ctx, asset_path)?
         };
@@ -1355,6 +1368,19 @@ fn carve_export_slice<'a>(
 /// Per-export `FByteBulkData` records surfaced by typed readers, paired
 /// with the export index they belong to (`payloads[idx]`). Fed to
 /// `Package::insert_bulk_records` so `resolve_bulk_for_export` lines up.
+/// Texture classes the unversioned-properties branch routes to the typed
+/// texture tail reader (mirrors the class names registered in
+/// `exports::dispatch` for the versioned path).
+fn texture_kind_for_class(class_name: &str) -> Option<super::TextureKind> {
+    match class_name {
+        "Texture2D" => Some(super::TextureKind::TwoD),
+        "TextureCube" => Some(super::TextureKind::Cube),
+        "Texture2DArray" => Some(super::TextureKind::Array),
+        "VolumeTexture" => Some(super::TextureKind::Volume),
+        _ => None,
+    }
+}
+
 type ExportBulkRecords = Vec<(usize, Vec<FByteBulkData>)>;
 
 fn read_payloads(

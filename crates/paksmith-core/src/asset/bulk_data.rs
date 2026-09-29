@@ -1314,6 +1314,20 @@ impl BulkDataResolver {
                 BulkDataTier::UexpResident
             };
             (tier, &self.stitched[..])
+        } else if record.flags.payload_is_inline() {
+            // `BULKDATA_ForceInlinePayload` (UE5 cooked textures set it
+            // together with `NoOffsetFixUp`, e.g. `0x00010048`): the
+            // payload sits in the export stream right after its header,
+            // and `OffsetInFile` addresses it within the stitched
+            // `.uasset` + `.uexp` buffer — same source as the
+            // end-of-file tier, with the header/uexp split deciding the
+            // reported tier.
+            let tier = if resolved_offset < self.total_header_size {
+                BulkDataTier::Inline
+            } else {
+                BulkDataTier::UexpResident
+            };
+            (tier, &self.stitched[..])
         } else {
             return Err(crate::PaksmithError::AssetParse {
                 asset_path: asset_path.to_string(),

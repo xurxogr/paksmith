@@ -457,9 +457,26 @@ fn read_unversioned_value(
             PropertyValue::Text(text)
         }
         MT::Enum { enum_name } => {
-            // Per CUE4Parse's EnumProperty constructor (`HasUnversionedProperties
-            // && type == NORMAL`): a single u8 ordinal — the default ByteProperty
-            // storage. Non-byte underlying types are rare and deferred.
+            // Per CUE4Parse's EnumProperty constructor: a top-level (or
+            // struct-member) enum in an unversioned package is a single u8
+            // ordinal (`HasUnversionedProperties && type == NORMAL`), but a
+            // collection element / map key / map value (`type == ARRAY |
+            // MAP`) is serialized by the property's own `SerializeItem`,
+            // which writes the qualified value name (`EEnum::Value`) as an
+            // FName. Container elements come through `synthetic_element`,
+            // whose marker is the empty property name.
+            if prop.name.is_empty() {
+                let qualified =
+                    read_fname_pair(cur, ctx, asset_path, AssetWireField::PropertyTagName)?;
+                let short: Arc<str> = match qualified.rsplit_once("::") {
+                    Some((_, tail)) => Arc::from(tail),
+                    None => Arc::clone(&qualified),
+                };
+                return Ok(PropertyValue::Enum {
+                    type_name: Arc::clone(enum_name),
+                    value: EnumValue::Named(short),
+                });
+            }
             let idx = cur.read_u8().map_err(|_| value_eof())?;
             // A name the `.usmap` has is shared; an ordinal it has no name
             // for keeps the enum's name by refcount rather than formatting a
@@ -518,6 +535,9 @@ fn read_unversioned_value(
             // typed-decode with a PER-ELEMENT boundary — sidestepping
             // the tagged path's whole-array `expected_end` hazard
             // (`containers::read_struct_property` doc).
+            if let Some(native) = read_native_struct(cur, struct_name, asset_path)? {
+                return Ok(native);
+            }
             if let Some(entry) = crate::asset::structs::lookup(struct_name) {
                 // Plain add, matching the 3g/3h callers (`FBox::read_from`,
                 // `render_data.rs`): `position()` is bounded by the
@@ -681,6 +701,100 @@ fn read_unversioned_value(
 /// bodies carry no per-element `FPropertyTag`, so the type comes from the
 /// `.usmap` schema inner type; the name/index are irrelevant. Shared by
 /// the `Array` / `Set` / `Map` arms (#639).
+/// Engine structs that UE serializes atomically (`WithSerializer` /
+/// `WithStructuredSerializer`), so their bytes carry NO unversioned
+/// fragment header even inside an unversioned package. Reading them
+/// through the `.usmap` schema would misinterpret their first two bytes
+/// as a fragment header and under-consume the stream (the "bool32 value
+/// 65536" symptom on the object-guid tail). Mirrors the name switch in
+/// CUE4Parse's `FScriptStruct` for the structs the typed registry
+/// (`crate::asset::structs`) does not already cover. Returns `None` for
+/// any other struct name so the caller falls through to the registry /
+/// schema path.
+fn read_native_struct(
+    cur: &mut Cursor<&[u8]>,
+    struct_name: &Arc<str>,
+    asset_path: &str,
+) -> crate::Result<Option<PropertyValue>> {
+    let value_eof = || truncated_at(asset_path, AssetWireField::UnversionedValue);
+    let field = |name: &str, value: PropertyValue| Property {
+        name: Arc::from(name),
+        array_index: 0,
+        guid: None,
+        value,
+    };
+    let i32_field = |cur: &mut Cursor<&[u8]>, name: &str| -> crate::Result<Property> {
+        let v = cur.read_i32::<LE>().map_err(|_| value_eof())?;
+        Ok(field(name, PropertyValue::Int(v)))
+    };
+    let structure = |properties: Vec<Property>| PropertyValue::Struct {
+        struct_name: Arc::clone(struct_name),
+        properties,
+    };
+    let v = match struct_name.as_ref() {
+        "Guid" => {
+            let mut raw = [0u8; 16];
+            cur.read_exact(&mut raw).map_err(|_| value_eof())?;
+            let words: Vec<String> = raw
+                .chunks(4)
+                .map(|c| format!("{:08X}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect();
+            PropertyValue::Str(words.concat())
+        }
+        "IntPoint" => structure(vec![i32_field(cur, "X")?, i32_field(cur, "Y")?]),
+        "IntVector" => structure(vec![
+            i32_field(cur, "X")?,
+            i32_field(cur, "Y")?,
+            i32_field(cur, "Z")?,
+        ]),
+        "IntVector4" => structure(vec![
+            i32_field(cur, "X")?,
+            i32_field(cur, "Y")?,
+            i32_field(cur, "Z")?,
+            i32_field(cur, "W")?,
+        ]),
+        "FrameNumber" => structure(vec![i32_field(cur, "Value")?]),
+        "DateTime" | "Timespan" => {
+            let ticks = cur.read_i64::<LE>().map_err(|_| value_eof())?;
+            structure(vec![field("Ticks", PropertyValue::Int64(ticks))])
+        }
+        "PerPlatformFloat"
+        | "PerPlatformInt"
+        | "PerPlatformBool"
+        | "PerQualityLevelInt"
+        | "PerQualityLevelFloat" => {
+            // `bool bCooked` (bool32) then `Default`; the per-platform /
+            // per-quality override map only follows when NOT cooked.
+            let cooked = cur.read_i32::<LE>().map_err(|_| value_eof())? != 0;
+            let default = match struct_name.as_ref() {
+                "PerPlatformFloat" | "PerQualityLevelFloat" => {
+                    PropertyValue::Float(cur.read_f32::<LE>().map_err(|_| value_eof())?)
+                }
+                "PerPlatformBool" => {
+                    PropertyValue::Bool(cur.read_i32::<LE>().map_err(|_| value_eof())? != 0)
+                }
+                _ => PropertyValue::Int(cur.read_i32::<LE>().map_err(|_| value_eof())?),
+            };
+            if !cooked {
+                let count = cur.read_i32::<LE>().map_err(|_| value_eof())?;
+                let count = u64::try_from(count).map_err(|_| value_eof())?;
+                if count > 4096 {
+                    return Err(value_eof());
+                }
+                let key_len: u64 = if struct_name.starts_with("PerQuality") {
+                    4
+                } else {
+                    8
+                };
+                cur.set_position(cur.position() + (key_len + 4) * count);
+            }
+            structure(vec![field("Default", default)])
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
 fn synthetic_element(inner: &MappedPropertyType) -> MappedProperty {
     MappedProperty {
         // Shared empty Arc — refcount bump, not a fresh allocation.

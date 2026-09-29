@@ -188,35 +188,47 @@ pub(crate) fn read_from_kind(
     // export root's tagged stream (#643).
     crate::asset::property::read_class_serialization_control(&mut cur, ctx, asset_path)?;
     let properties = read_properties(&mut cur, ctx, 0, total_len, asset_path)?;
-    let _object_guid = read_object_guid_tail(&mut cur, total_len, asset_path)?;
+    read_tail(&mut cur, total_len, ctx, asset_path, kind, properties)
+}
+
+/// Everything after the property list of a texture export: object-guid
+/// tail, platform-data header, mip records and (optionally) the
+/// virtual-texture block. Shared by the versioned reader above and by the
+/// unversioned-properties branch in `package.rs`, which decodes the
+/// property list through the `.usmap` schema first and then hands the
+/// cursor here.
+pub(crate) fn read_tail(
+    cur: &mut Cursor<&[u8]>,
+    total_len: u64,
+    ctx: &AssetContext,
+    asset_path: &str,
+    kind: TextureKind,
+    properties: Vec<crate::asset::property::primitives::Property>,
+) -> crate::Result<(Texture2DData, Vec<FByteBulkData>)> {
+    let _object_guid = read_object_guid_tail(cur, total_len, asset_path)?;
 
     // Segment-2 entry: UTexture/subclass FStripDataFlags + owner
     // bCooked + (2D only) bSerializeMipData, preceding the
     // FTexturePlatformData.
-    let serialize_mip_data = read_segment2_entry(&mut cur, ctx, asset_path, kind)?;
+    let serialize_mip_data = read_segment2_entry(cur, ctx, asset_path, kind)?;
 
     // DeserializeCookedPlatformData's leading key: the running-platform
     // `pixelFormatName` (FName) + `skipOffset` (i64/i32) that wrap the
     // FTexturePlatformData. paksmith reads only the first/primary platform
     // data and stops at the mips, so the trailing `bIsVirtual` + the
     // `None`-terminated multi-format loop stay deferred (3e-VT).
-    read_platform_data_key(&mut cur, ctx, asset_path)?;
+    read_platform_data_key(cur, ctx, asset_path)?;
 
     // Segment 2: FTexturePlatformData header (3e-2).
-    let header = read_platform_data_header(&mut cur, ctx, asset_path)?;
+    let header = read_platform_data_header(cur, ctx, asset_path)?;
 
     // Segment 2 (cont.): the per-mip FTexture2DMipMap records (3e-3).
     // `bulk_records` are returned to the dispatch caller, which stores
     // them in `Package` so the bytes resolve lazily; `mips` holds the
     // per-mip dimensions. They correspond positionally (`mips[i]` ↔
     // `bulk_records[i]`) when `serialize_mip_data` is set.
-    let (mips, mut bulk_records) = read_mip_records(
-        &mut cur,
-        ctx,
-        header.mip_count,
-        serialize_mip_data,
-        asset_path,
-    )?;
+    let (mips, mut bulk_records) =
+        read_mip_records(cur, ctx, header.mip_count, serialize_mip_data, asset_path)?;
 
     // `bIsVirtual` (CUE4Parse `Ar.Versions["VirtualTextures"]`, UE 4.23+):
     // the trailing `UTexture2D` flag marking a virtual (sparse/paged) texture
@@ -231,13 +243,13 @@ pub(crate) fn read_from_kind(
     // payloads are appended to `bulk_records` (so the resolver's per-package
     // budget covers them) — keyed by export index alongside any mip records.
     let is_virtual = if ctx.version.is_virtual_textures_or_later() {
-        read_owner_bool(&mut cur, asset_path, AssetWireField::TextureIsVirtual)?
+        read_owner_bool(cur, asset_path, AssetWireField::TextureIsVirtual)?
     } else {
         false
     };
     let virtual_texture = if is_virtual {
         Some(Box::new(virtual_textures::read_from(
-            &mut cur,
+            cur,
             ctx,
             asset_path,
             &mut bulk_records,

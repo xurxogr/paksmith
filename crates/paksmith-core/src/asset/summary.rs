@@ -255,7 +255,7 @@ impl PackageSummary {
     /// - [`AssetParseFault::UnsupportedFileVersionUE4`] if
     ///   `file_version_ue4 < VER_UE4_NAME_HASHES_SERIALIZED` (504).
     /// - [`AssetParseFault::UnsupportedFileVersionUE5`] if
-    ///   `file_version_ue5 >= FIRST_UNSUPPORTED_UE5_VERSION` (1014).
+    ///   `file_version_ue5 >= FIRST_UNSUPPORTED_UE5_VERSION` (1018).
     /// - [`AssetParseFault::NegativeValue`] (with field
     ///   [`AssetWireField::TotalHeaderSize`], [`AssetWireField::GenerationCount`],
     ///   [`AssetWireField::AdditionalPackagesToCookCount`], or
@@ -391,11 +391,9 @@ impl PackageSummary {
                 (4, _) => None,
                 (5, 0) => Some(1004),
                 (5, 1) => Some(1008),
-                (5, 2) => Some(1009),
-                (5, 3) => Some(1009),
+                (5, 2 | 3) => Some(1009),
                 (5, 4) => Some(1012),
                 (5, 5) => Some(1013),
-                (5, 6) => Some(1017),
                 _ => Some(1017),
             };
             tracing::warn!(hint = %h, ue4 = file_version_ue4, ue5 = ?file_version_ue5,
@@ -1150,6 +1148,7 @@ mod tests {
         buf.extend_from_slice(&(-7i32).to_le_bytes()); // legacy
         buf.extend_from_slice(&(-1i32).to_le_bytes()); // ue3
         buf.extend_from_slice(&(503i32).to_le_bytes()); // file_version_ue4 < 504
+        buf.extend_from_slice(&(0i32).to_le_bytes()); // licensee (read before the gate)
         let err = PackageSummary::read_from(&mut Cursor::new(&buf), "x.uasset").unwrap_err();
         assert!(matches!(
             err,
@@ -1160,18 +1159,19 @@ mod tests {
         ));
     }
 
-    /// The exact ceiling boundary (#643): 1014
-    /// (`METADATA_SERIALIZATION_OFFSET`, unread summary field) and
-    /// above are rejected with the version echoed back.
+    /// The exact ceiling boundary: `FIRST_UNSUPPORTED_UE5_VERSION`
+    /// (1018, first version past UE 5.6's 1017) and above are rejected
+    /// with the version echoed back.
     #[test]
     fn rejects_ue5_above_ceiling() {
-        for ue5 in [1014i32, 1015, 1016] {
+        for ue5 in [1018i32, 1019, 1020] {
             let mut buf = vec![];
             buf.extend_from_slice(&PACKAGE_FILE_TAG.to_le_bytes());
             buf.extend_from_slice(&(-8i32).to_le_bytes());
             buf.extend_from_slice(&(-1i32).to_le_bytes());
             buf.extend_from_slice(&(522i32).to_le_bytes()); // ue4
             buf.extend_from_slice(&ue5.to_le_bytes());
+            buf.extend_from_slice(&(0i32).to_le_bytes()); // licensee (read before the gate)
             let err = PackageSummary::read_from(&mut Cursor::new(&buf), "x.uasset").unwrap_err();
             assert!(
                 matches!(

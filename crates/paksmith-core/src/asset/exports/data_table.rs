@@ -211,7 +211,6 @@ pub(crate) fn read_rows_unversioned(
     })
 }
 
-
 /// Row-vec reservation count: `num_rows` clamped to the most rows
 /// `remaining_bytes` (the payload still ahead of the row cursor) could
 /// hold (each row is `>= MIN_ROW_BYTES`). Keeps a dishonest `NumRows`
