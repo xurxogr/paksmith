@@ -68,7 +68,7 @@ const MAX_INHERITANCE_DEPTH: usize = 64;
 /// 4096 is a wide safety margin.
 ///
 /// Exposed via [`max_usmap_enum_count`].
-const MAX_USMAP_ENUM_COUNT: u32 = 4_096;
+const MAX_USMAP_ENUM_COUNT: u32 = 65_536;
 
 /// Hard cap on per-enum `value_count`. `LargeEnums` (v3) widened the
 /// wire field to `u16` (65535 max); no real-world enum has that many
@@ -101,7 +101,7 @@ const MAX_USMAP_EXPANDED_PROPERTIES_PER_SCHEMA: u32 = 65_536;
 /// and matches the [`MAX_USMAP_ENUM_COUNT`] rationale.
 ///
 /// Exposed via [`max_usmap_schema_count`].
-const MAX_USMAP_SCHEMA_COUNT: u32 = 4_096;
+const MAX_USMAP_SCHEMA_COUNT: u32 = 262_144;
 
 /// Hard cap on the wire-claimed `name_count`. Without this cap the
 /// 256 MiB `MAX_USMAP_DECOMPRESSED_SIZE` budget alone permitted a
@@ -113,7 +113,7 @@ const MAX_USMAP_SCHEMA_COUNT: u32 = 4_096;
 /// to a single-digit-MiB slot reservation.
 ///
 /// Exposed via [`max_usmap_name_count`].
-const MAX_USMAP_NAME_COUNT: u32 = 131_072;
+const MAX_USMAP_NAME_COUNT: u32 = 2_097_152;
 
 /// Hard cap on the total entry count in the flattened-property cache
 /// (#370), summed across every class's flattened inheritance chain.
@@ -647,7 +647,8 @@ impl Usmap {
             })
         };
         if version >= USMAP_VERSION_PACKAGE_VERSIONING {
-            let has_versioning = cur.read_u8().map_err(|_| trunc(&cur))? != 0;
+            // UE serialises bool as a 4-byte int (CUE4Parse `Ar.ReadBoolean()`).
+            let has_versioning = cur.read_i32::<LE>().map_err(|_| trunc(&cur))? != 0;
             if has_versioning {
                 // object_version + object_version_ue5 + custom_version array + net_cl
                 let _obj_ver = cur.read_i32::<LE>().map_err(|_| trunc(&cur))?;
@@ -1342,6 +1343,11 @@ pub struct ResolvedProperty {
 /// even though the wire bytes were fully readable).
 fn read_name_arc(cur: &mut Cursor<&[u8]>, names: &[Arc<str>]) -> crate::Result<Arc<str>> {
     let idx = cur.read_i32::<LE>()?;
+    // CUE4Parse `UsmapParser.ReadName`: index -1 is the null name (used
+    // by UE4SS/Dumper-7 for "no super type"); surface it as "None".
+    if idx == -1 {
+        return Ok(Arc::from("None"));
+    }
     #[allow(
         clippy::cast_sign_loss,
         reason = "negative indices wrap to a huge usize that fails the get() bounds check, surfacing as NameIndexOutOfRange"
@@ -1447,12 +1453,19 @@ fn read_mapped_type(
             }
         }
         26 => {
-            // EnumProperty: inner type byte then enum name
-            let _inner_byte = cur.read_u8()?; // always ByteProperty (0) in practice
+            // EnumProperty: the inner type is a full recursive type node
+            // (ByteProperty in practice); parse it so the stream stays aligned.
+            let _inner = read_mapped_type(cur, names, depth + 1, nodes)?;
             let enum_name = read_name_arc(cur, names)?;
             MappedPropertyType::Enum { enum_name }
         }
         27 => MappedPropertyType::Unknown(type_byte), // FieldPathProperty
+        28 => {
+            // OptionalProperty (UE 5.4+): carries an inner type on the wire
+            // which MUST be consumed or the schema stream desyncs.
+            let _inner = read_mapped_type(cur, names, depth + 1, nodes)?;
+            MappedPropertyType::Unknown(type_byte)
+        }
         other => MappedPropertyType::Unknown(other),
     })
 }

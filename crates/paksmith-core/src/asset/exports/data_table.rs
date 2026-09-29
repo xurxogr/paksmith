@@ -143,6 +143,75 @@ pub(crate) fn read_from(
     })
 }
 
+/// PROTOTYPE (anvil): unversioned `UDataTable` body. Class properties
+/// were already consumed by the caller via the usmap; what remains is
+/// `i32 NumRows` then per row `FName` + unversioned `RowStruct` body.
+pub(crate) fn read_rows_unversioned(
+    cur: &mut Cursor<&[u8]>,
+    class_props: Vec<Property>,
+    usmap: &crate::asset::Usmap,
+    ctx: &AssetContext,
+    asset_path: &str,
+) -> crate::Result<DataTableData> {
+    let total_len = cur.get_ref().len() as u64;
+    // UObject tail after script properties: `bool bHasGuid` (+ FGuid).
+    let _object_guid = read_object_guid_tail(cur, total_len, asset_path)?;
+    let row_struct = resolve_row_struct(&class_props, asset_path);
+    let class_properties = PropertyBag::Tree {
+        properties: class_props,
+    };
+    let raw_count = cur
+        .read_i32::<LittleEndian>()
+        .map_err(|_| PaksmithError::AssetParse {
+            asset_path: asset_path.to_string(),
+            fault: AssetParseFault::UnexpectedEof {
+                field: AssetWireField::DataTableNumRows,
+            },
+        })?;
+    let num_rows = usize::try_from(raw_count).map_err(|_| PaksmithError::AssetParse {
+        asset_path: asset_path.to_string(),
+        fault: AssetParseFault::DataTableRowCountNegative { count: raw_count },
+    })?;
+    if num_rows > MAX_ROWS_PER_DATATABLE {
+        return Err(PaksmithError::AssetParse {
+            asset_path: asset_path.to_string(),
+            fault: AssetParseFault::DataTableRowCountExceeded {
+                count: num_rows,
+                cap: MAX_ROWS_PER_DATATABLE,
+            },
+        });
+    }
+    let remaining = total_len.saturating_sub(cur.position());
+    let mut rows: Vec<DataTableRow> = Vec::new();
+    try_reserve_asset(
+        &mut rows,
+        reserve_count(num_rows, remaining),
+        asset_path,
+        AssetSeam::DataTableRows,
+    )?;
+    for _ in 0..num_rows {
+        let name = read_fname_pair(cur, ctx, asset_path, AssetWireField::DataTableRowName)?;
+        let properties = crate::asset::property::unversioned::read_unversioned_properties(
+            cur,
+            &row_struct,
+            usmap,
+            ctx,
+            asset_path,
+            1,
+        )?;
+        rows.push(DataTableRow {
+            name: name.to_string(),
+            properties,
+        });
+    }
+    Ok(DataTableData {
+        row_struct,
+        rows,
+        class_properties,
+    })
+}
+
+
 /// Row-vec reservation count: `num_rows` clamped to the most rows
 /// `remaining_bytes` (the payload still ahead of the row cursor) could
 /// hold (each row is `>= MIN_ROW_BYTES`). Keeps a dishonest `NumRows`

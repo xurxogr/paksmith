@@ -79,7 +79,7 @@ const MAX_CHUNK_ID_COUNT: i32 = 65_536;
 /// - `VERSE_CELLS = 1015` adds four cell-table summary fields;
 ///   `PACKAGE_SAVED_HASH = 1016` replaces the summary's `FGuid` with
 ///   an `FIoHash` and moves `TotalHeaderSize`.
-pub const FIRST_UNSUPPORTED_UE5_VERSION: i32 = 1014;
+pub const FIRST_UNSUPPORTED_UE5_VERSION: i32 = 1018;
 
 /// `PKG_FilterEditorOnly` — UE's `EPackageFlags` bit for "this archive
 /// was cooked and stripped of editor-only state". Cooked game archives
@@ -321,6 +321,19 @@ impl PackageSummary {
     // chunk_id_count). Bit-preserving by construction.
     #[allow(clippy::cast_sign_loss)]
     pub fn read_from<R: Read>(reader: &mut R, asset_path: &str) -> crate::Result<Self> {
+        Self::read_from_with_hint(reader, asset_path, None)
+    }
+
+    /// PROTOTYPE (anvil): like `read_from`, but an engine-version hint
+    /// lets fully unversioned packages (UE4/UE5/licensee all 0) be read
+    /// by synthesising the object versions the way CUE4Parse's
+    /// `Ar.Ver = Ar.Game.GetVersion()` does.
+    #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
+    pub fn read_from_with_hint<R: Read>(
+        reader: &mut R,
+        asset_path: &str,
+        hint: Option<crate::asset::UeVersion>,
+    ) -> crate::Result<Self> {
         // Magic
         let tag = reader.read_u32::<LittleEndian>()?;
         if tag != PACKAGE_FILE_TAG {
@@ -352,7 +365,42 @@ impl PackageSummary {
             });
         }
         let _legacy_ue3_version = reader.read_i32::<LittleEndian>()?;
-        let file_version_ue4 = reader.read_i32::<LittleEndian>()?;
+        let mut file_version_ue4 = reader.read_i32::<LittleEndian>()?;
+        let mut file_version_ue5 = if legacy_file_version <= -8 {
+            Some(reader.read_i32::<LittleEndian>()?)
+        } else {
+            None
+        };
+        let file_version_licensee_ue4 = reader.read_i32::<LittleEndian>()?;
+        let is_unversioned = file_version_ue4 == 0
+            && file_version_ue5.unwrap_or(0) == 0
+            && file_version_licensee_ue4 == 0;
+        if is_unversioned {
+            // Synthesise from the hint (CUE4Parse UEVersions.GetVersion).
+            let Some(h) = hint else {
+                return Err(PaksmithError::AssetParse {
+                    asset_path: asset_path.to_string(),
+                    fault: AssetParseFault::UnsupportedFileVersionUE4 {
+                        version: 0,
+                        minimum: VER_UE4_NAME_HASHES_SERIALIZED,
+                    },
+                });
+            };
+            file_version_ue4 = 522;
+            file_version_ue5 = match (h.major, h.minor) {
+                (4, _) => None,
+                (5, 0) => Some(1004),
+                (5, 1) => Some(1008),
+                (5, 2) => Some(1009),
+                (5, 3) => Some(1009),
+                (5, 4) => Some(1012),
+                (5, 5) => Some(1013),
+                (5, 6) => Some(1017),
+                _ => Some(1017),
+            };
+            tracing::warn!(hint = %h, ue4 = file_version_ue4, ue5 = ?file_version_ue5,
+                "unversioned package: object versions synthesised from engine hint");
+        }
         if file_version_ue4 < VER_UE4_NAME_HASHES_SERIALIZED {
             return Err(PaksmithError::AssetParse {
                 asset_path: asset_path.to_string(),
@@ -362,11 +410,6 @@ impl PackageSummary {
                 },
             });
         }
-        let file_version_ue5 = if legacy_file_version <= -8 {
-            Some(reader.read_i32::<LittleEndian>()?)
-        } else {
-            None
-        };
         if let Some(v) = file_version_ue5
             && v >= FIRST_UNSUPPORTED_UE5_VERSION
         {
@@ -378,7 +421,6 @@ impl PackageSummary {
                 },
             });
         }
-        let file_version_licensee_ue4 = reader.read_i32::<LittleEndian>()?;
         let version = AssetVersion {
             legacy_file_version,
             file_version_ue4,
@@ -386,11 +428,26 @@ impl PackageSummary {
             file_version_licensee_ue4,
         };
 
+        // UE5 1016 PACKAGE_SAVED_HASH: 20-byte FIoHash + TotalHeaderSize
+        // move BEFORE the custom-version container (CUE4Parse order,
+        // confirmed against Anvil Empires 5.6 bytes).
+        let mut saved_hash = [0u8; 20];
+        let total_header_size = if version.ue5_at_least(1016) {
+            reader.read_exact(&mut saved_hash)?;
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
+
         // Custom versions
         let custom_versions = CustomVersionContainer::read_from(reader, asset_path)?;
 
         // Header size + folder
-        let total_header_size = reader.read_i32::<LittleEndian>()?;
+        let total_header_size = if version.ue5_at_least(1016) {
+            total_header_size
+        } else {
+            reader.read_i32::<LittleEndian>()?
+        };
         if total_header_size < 0 {
             return Err(PaksmithError::AssetParse {
                 asset_path: asset_path.to_string(),
@@ -461,6 +518,14 @@ impl PackageSummary {
         let export_offset = reader.read_i32::<LittleEndian>()?;
         let import_count = reader.read_i32::<LittleEndian>()?;
         let import_offset = reader.read_i32::<LittleEndian>()?;
+        if version.ue5_at_least(1015) {
+            for _ in 0..4 {
+                let _cell = reader.read_i32::<LittleEndian>()?;
+            }
+        }
+        if version.ue5_at_least(1014) {
+            let _meta_data_offset = reader.read_i32::<LittleEndian>()?;
+        }
         let depends_offset = reader.read_i32::<LittleEndian>()?;
         let soft_package_references_count = reader.read_i32::<LittleEndian>()?;
         let soft_package_references_offset = reader.read_i32::<LittleEndian>()?;
@@ -491,7 +556,12 @@ impl PackageSummary {
         // Both GUIDs are skipped entirely on cooked-game input (the
         // common case for paksmith); `OwnerPersistentGuid` is further
         // restricted to a narrow uncooked window.
-        let guid = FGuid::read_from(reader)?;
+        let guid = if version.ue5_at_least(1016) {
+            let _ = saved_hash;
+            FGuid::from_bytes([0u8; 16])
+        } else {
+            FGuid::read_from(reader)?
+        };
         let editor_only_section = (package_flags & PKG_FILTER_EDITOR_ONLY) == 0;
         let persistent_guid =
             if editor_only_section && version.ue4_at_least(VER_UE4_ADDED_PACKAGE_OWNER) {

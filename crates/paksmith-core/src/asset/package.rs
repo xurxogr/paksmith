@@ -662,7 +662,7 @@ impl Package {
         let stitched: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
         let bytes: &[u8] = &stitched;
         let mut cursor = Cursor::new(bytes);
-        let summary = PackageSummary::read_from(&mut cursor, asset_path)?;
+        let summary = PackageSummary::read_from_with_hint(&mut cursor, asset_path, opts.engine_version_hint)?;
 
         // UE 5.2+ object data-resource table (#642). When populated, it
         // governs bulk resolution package-wide: every `FByteBulkData`
@@ -887,7 +887,19 @@ impl Package {
                     asset_path,
                     0,
                 )?;
-                payloads.push(super::Asset::Generic(PropertyBag::tree(props)));
+                if &*class_name == "DataTable" {
+                    // PROTOTYPE (anvil): typed DataTable rows for unversioned packages.
+                    let dt = crate::asset::exports::data_table::read_rows_unversioned(
+                        &mut export_cur,
+                        props,
+                        usmap,
+                        &ctx,
+                        asset_path,
+                    )?;
+                    payloads.push(super::Asset::DataTable(dt));
+                } else {
+                    payloads.push(super::Asset::Generic(PropertyBag::tree(props)));
+                }
             }
             // Unversioned bodies never reach typed dispatch (they're
             // schema-serialized, not tagged), so they surface no bulk
