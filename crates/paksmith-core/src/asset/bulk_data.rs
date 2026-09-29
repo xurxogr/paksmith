@@ -745,12 +745,49 @@ impl FByteBulkData {
         let inline_payload =
             Self::consume_inline(reader, flags, size_on_disk, capture_inline, asset_path)?;
 
+        // An in-stream payload's entry offset is the saver's position in
+        // the *exports* archive (UE 5.2+ `SavePackage` records
+        // `ExportsArchive.Tell()`), i.e. relative to the start of the
+        // export data — NOT absolute in the stitched buffer. UE itself
+        // never dereferences it (it serializes the bytes in-stream), so
+        // the value is only meaningful once `total_header_size` is added;
+        // a UE 5.6 icon (`Textures/UI/Items/Gold`, 735-byte header)
+        // carries `serial_offset = 0x74` for a payload at `.uexp + 0x74`.
+        // Separate-file / end-of-file entries keep their absolute offset
+        // (they address the `.ubulk` / the bulk region directly).
+        let payload_in_stream = flags.payload_is_inline()
+            && !flags.payload_at_end_of_file()
+            && !flags.payload_in_separate_file();
+        let offset_in_file = match (&ctx.bulk_resolver, payload_in_stream) {
+            (Some(resolver), true) => {
+                let header = i64::try_from(resolver.total_header_size).map_err(|_| {
+                    crate::PaksmithError::AssetParse {
+                        asset_path: asset_path.to_string(),
+                        fault: crate::error::AssetParseFault::BulkDataOffsetFixupOverflow {
+                            offset: entry.serial_offset,
+                            fixup: i64::MAX,
+                        },
+                    }
+                })?;
+                entry.serial_offset.checked_add(header).ok_or_else(|| {
+                    crate::PaksmithError::AssetParse {
+                        asset_path: asset_path.to_string(),
+                        fault: crate::error::AssetParseFault::BulkDataOffsetFixupOverflow {
+                            offset: entry.serial_offset,
+                            fixup: header,
+                        },
+                    }
+                })?
+            }
+            _ => entry.serial_offset,
+        };
+
         Ok((
             Self {
                 flags: flags_out,
                 element_count,
                 size_on_disk,
-                offset_in_file: entry.serial_offset,
+                offset_in_file,
             },
             inline_payload,
         ))
@@ -1925,6 +1962,65 @@ mod tests {
             record.flags.no_offset_fixup(),
             "NoOffsetFixUp must be synthesized — entry offsets are absolute"
         );
+    }
+
+    /// An in-stream (`ForceInlinePayload`, neither end-of-file nor
+    /// separate-file) entry's `serial_offset` is relative to the start
+    /// of the export data, so the translated record carries
+    /// `serial_offset + total_header_size` and the resolver reads the
+    /// payload from the `.uexp` body (UE 5.6 `Textures/UI/Items/Gold`:
+    /// header 735, entry 0x74, payload at stitched 735 + 0x74).
+    #[cfg(feature = "__test_utils")]
+    #[test]
+    fn read_from_ctx_indexed_inline_offset_is_relative_to_export_data() {
+        let header = 735u64;
+        let mut stitched = vec![0u8; usize::try_from(header).unwrap() + 0x74];
+        stitched.extend_from_slice(&[0xABu8; 8]);
+        let bulk = BulkDataResolver::new_for_test(stitched, header, 10_875);
+        let mut ctx = ctx_with_resources(vec![resource_entry(
+            FLAG_FORCE_INLINE_PAYLOAD | 0x08,
+            0x74,
+            8,
+            8,
+        )]);
+        ctx.bulk_resolver = Some(std::sync::Arc::new(bulk));
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&0i32.to_le_bytes());
+        wire.extend_from_slice(&[0xABu8; 8]);
+        let record =
+            FByteBulkData::read_from_ctx(&mut std::io::Cursor::new(&wire[..]), &ctx, "t").unwrap();
+        assert_eq!(record.offset_in_file, 735 + 0x74);
+        assert!(record.flags.no_offset_fixup());
+        let resolved = ctx
+            .bulk_resolver
+            .as_ref()
+            .unwrap()
+            .resolve(&record, "t")
+            .expect("resolve inline payload");
+        assert_eq!(resolved.tier, BulkDataTier::UexpResident);
+        assert_eq!(resolved.bytes, vec![0xABu8; 8]);
+    }
+
+    /// End-of-file / separate-file entries keep their absolute offset
+    /// even when a resolver is present — only in-stream payloads are
+    /// export-data-relative.
+    #[cfg(feature = "__test_utils")]
+    #[test]
+    fn read_from_ctx_indexed_end_of_file_offset_stays_absolute() {
+        let resolver = BulkDataResolver::new_for_test(vec![0u8; 1024], 735, 0);
+        let mut ctx = ctx_with_resources(vec![resource_entry(
+            FLAG_FORCE_INLINE_PAYLOAD | FLAG_PAYLOAD_AT_END_OF_FILE,
+            0x300,
+            8,
+            8,
+        )]);
+        ctx.bulk_resolver = Some(std::sync::Arc::new(resolver));
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&0i32.to_le_bytes());
+        wire.extend_from_slice(&[0u8; 8]);
+        let record =
+            FByteBulkData::read_from_ctx(&mut std::io::Cursor::new(&wire[..]), &ctx, "t").unwrap();
+        assert_eq!(record.offset_in_file, 0x300);
     }
 
     /// An inline-flagged entry's payload bytes still follow the i32
