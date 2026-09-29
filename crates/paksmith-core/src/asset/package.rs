@@ -855,11 +855,32 @@ impl Package {
                 // resolves to an empty name, so null class refs flow
                 // through cleanly and `get_all_properties("")` returns
                 // an empty schema (handled inside the decoder).
-                let class_name = crate::asset::property::primitives::resolve_package_index(
+                let mut class_name = crate::asset::property::primitives::resolve_package_index(
                     export.class_index,
                     &ctx,
                     asset_path,
                 )?;
+                // Two Blueprint assets can generate classes with the same
+                // bare name; the usmap then also registers each schema
+                // under `Class@Super` (see `disambiguated_schema_key`).
+                // When the class is an export of this package its
+                // `super_index` tells us which one applies.
+                if let crate::PackageIndex::Export(class_export) = export.class_index
+                    && let Some(class_export) = exports.exports.get(class_export as usize)
+                {
+                    let super_name = crate::asset::property::primitives::resolve_package_index(
+                        class_export.super_index,
+                        &ctx,
+                        asset_path,
+                    )?;
+                    let key = crate::asset::mappings::disambiguated_schema_key(
+                        &class_name,
+                        &super_name,
+                    );
+                    if usmap.schemas.contains_key(&key) {
+                        class_name = std::sync::Arc::from(key);
+                    }
+                }
                 let export_slice = carve_export_slice(bytes, export, asset_path)?;
 
                 // Typed dispatch is VERSIONED-ONLY. The registered typed

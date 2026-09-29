@@ -21,7 +21,7 @@ use std::io::{Cursor, Read};
 use std::sync::{Arc, LazyLock};
 
 use byteorder::{LE, ReadBytesExt};
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::asset::AssetContext;
 use crate::asset::package_index::PackageIndex;
@@ -281,13 +281,15 @@ pub(crate) fn read_unversioned_properties(
     if all_props.is_empty() {
         // A struct that IS in the .usmap but declares no properties
         // (e.g. `PointerToUberGraphFrame`, the transient frame pointer
-        // every Blueprint CDO carries) occupies zero bytes on the wire:
-        // `SerializeUnversionedProperties` writes no header for a
-        // struct without serialisable members. Emit an empty bag and
-        // leave the cursor where it is — verified against Anvil's
-        // BPVis* CDOs, where the properties after `UberGraphFrame`
-        // decode correctly only with this zero-width treatment.
+        // every Blueprint CDO carries) still goes through
+        // `SerializeUnversionedProperties`, which writes an empty
+        // header: one fragment, zero values, `bIsLast` set (`00 01`).
+        // Read that header so the cursor lands on the next property
+        // — Anvil's `BPVisWaterWheel` CDO has `UberGraphFrame`
+        // serialised and every following property is off by two bytes
+        // otherwise. Fall through to the header read below.
         if usmap.schemas.contains_key(class_name) {
+            let _ = UnversionedHeader::read(cur, asset_path)?;
             return Ok(Vec::new());
         }
         // At depth 0 the export simply has no schema — log and emit an
@@ -339,6 +341,14 @@ pub(crate) fn read_unversioned_properties(
             continue;
         }
         let mapped_prop = &resolved.property;
+        trace!(
+            class_name,
+            depth,
+            property = mapped_prop.name.as_ref(),
+            ty = ?mapped_prop.prop_type,
+            pos = cur.position(),
+            "unversioned property"
+        );
 
         match read_unversioned_value(cur, mapped_prop, usmap, ctx, asset_path, depth) {
             Ok(value) => {

@@ -426,6 +426,17 @@ pub struct ClassSchema {
     pub properties: Vec<MappedProperty>,
 }
 
+
+/// Key under which a class schema that shares its bare name with another
+/// one (`FoodTrough_C` generated both by `Structures/FoodTrough` and by
+/// `Structures/FootprintAssets/FoodTrough`) is also registered:
+/// `Class@Super`. The package reader knows the export's super class from
+/// its `BlueprintGeneratedClass` export and can pick the right schema.
+#[must_use]
+pub fn disambiguated_schema_key(class_name: &str, super_name: &str) -> String {
+    format!("{class_name}@{super_name}")
+}
+
 /// Parsed `.usmap` mappings file: a registry of class schemas plus the
 /// enum-value tables needed to resolve unversioned `EnumProperty` reads.
 ///
@@ -1051,15 +1062,39 @@ impl Usmap {
                 }));
             }
 
-            let _ = schemas.insert(
-                name.clone(),
-                ClassSchema {
-                    name,
-                    super_type,
-                    prop_count,
-                    properties,
-                },
-            );
+            // Blueprint classes are keyed by bare name, so two assets
+            // whose generated class shares a name (Anvil ships
+            // `Structures/FoodTrough` and
+            // `Structures/FootprintAssets/FoodTrough`, both
+            // `FoodTrough_C`) collide here and the later schema wins.
+            // Exports of the other class will then mis-decode; say so.
+            let schema = ClassSchema {
+                name: name.clone(),
+                super_type,
+                prop_count,
+                properties,
+            };
+            if let Some(prev) = schemas.get(&name) {
+                tracing::debug!(
+                    schema = %name,
+                    previous_super = %prev.super_type.as_deref().unwrap_or(""),
+                    previous_props = prev.prop_count,
+                    new_super = %schema.super_type.as_deref().unwrap_or(""),
+                    new_props = schema.prop_count,
+                    "duplicate class schema in .usmap; the later one wins the bare name, \
+                     both stay reachable under `Class@Super`"
+                );
+                let prev = prev.clone();
+                let _ = schemas.insert(
+                    disambiguated_schema_key(&name, prev.super_type.as_deref().unwrap_or("")),
+                    prev,
+                );
+                let _ = schemas.insert(
+                    disambiguated_schema_key(&name, schema.super_type.as_deref().unwrap_or("")),
+                    schema.clone(),
+                );
+            }
+            let _ = schemas.insert(name, schema);
         }
 
         // Pre-compute the flattened-property cache (#370). One walk
@@ -1418,12 +1453,15 @@ fn read_mapped_type(
         10 => MappedPropertyType::Str,        // StrProperty
         11 => MappedPropertyType::Text,       // TextProperty
         17 => MappedPropertyType::SoftObject, // SoftObjectProperty (FSoftObjectPath: FName + FString)
-        // WeakObject (14), LazyObject (15), AssetObject (16) have distinct
-        // wire formats (LazyObject is a 16-byte FUniqueObjectGuid;
-        // WeakObject and AssetObject differ from SoftObject in subtle ways).
-        // Map them to Unknown so the reader emits UnversionedTypeNotSupported
-        // rather than silently misparsing FSoftObjectPath bytes.
-        14 | 15 | 16 => MappedPropertyType::Unknown(type_byte),
+        // WeakObject (14): FWeakObjectProperty::SerializeItem writes the
+        // pointed-to UObject* like ObjectProperty does, i.e. a 4-byte
+        // FPackageIndex in cooked packages (Anvil: `LeaderPoseComponent`
+        // on BPVisHorse). LazyObject (15) is a 16-byte FUniqueObjectGuid and
+        // AssetObject (16) differs from SoftObject in subtle ways; keep those
+        // Unknown so the reader emits UnversionedTypeNotSupported rather than
+        // silently misparsing the bytes.
+        14 => MappedPropertyType::Object,
+        15 | 16 => MappedPropertyType::Unknown(type_byte),
         18 => MappedPropertyType::UInt64, // UInt64Property
         19 => MappedPropertyType::UInt32, // UInt32Property
         20 => MappedPropertyType::UInt16, // UInt16Property
