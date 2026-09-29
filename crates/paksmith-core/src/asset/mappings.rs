@@ -426,7 +426,6 @@ pub struct ClassSchema {
     pub properties: Vec<MappedProperty>,
 }
 
-
 /// Key under which a class schema that shares its bare name with another
 /// one (`FoodTrough_C` generated both by `Structures/FoodTrough` and by
 /// `Structures/FootprintAssets/FoodTrough`) is also registered:

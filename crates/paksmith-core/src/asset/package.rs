@@ -873,10 +873,8 @@ impl Package {
                         &ctx,
                         asset_path,
                     )?;
-                    let key = crate::asset::mappings::disambiguated_schema_key(
-                        &class_name,
-                        &super_name,
-                    );
+                    let key =
+                        crate::asset::mappings::disambiguated_schema_key(&class_name, &super_name);
                     if usmap.schemas.contains_key(&key) {
                         class_name = std::sync::Arc::from(key);
                     }

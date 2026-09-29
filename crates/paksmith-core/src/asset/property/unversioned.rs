@@ -559,6 +559,11 @@ fn read_unversioned_value(
             if let Some(native) = read_native_struct(cur, struct_name, asset_path)? {
                 return Ok(native);
             }
+            if let Some(native) =
+                read_niagara_variable(cur, struct_name, usmap, ctx, asset_path, depth)?
+            {
+                return Ok(native);
+            }
             if let Some(entry) = crate::asset::structs::lookup(struct_name) {
                 // Plain add, matching the 3g/3h callers (`FBox::read_from`,
                 // `render_data.rs`): `position()` is bounded by the
@@ -814,6 +819,97 @@ fn read_native_struct(
         _ => return Ok(None),
     };
     Ok(Some(v))
+}
+
+/// `FNiagaraVariableBase` / `FNiagaraVariable` / `FNiagaraVariableWithOffset`
+/// carry `WithSerializer` in the engine, so a cooked package holds a hand
+/// written blob instead of the usmap property list: `Name` (FName), the
+/// `FNiagaraTypeDefinition` as ordinary unversioned properties (its own
+/// header included), then `VarData` (`TArray<uint8>`) for `FNiagaraVariable`
+/// or `Offset` (`int32`) for `FNiagaraVariableWithOffset`. Mirrors
+/// CUE4Parse's `FNiagaraVariableBase` / `FNiagaraVariable` /
+/// `FNiagaraVariableWithOffset` classes. Following the usmap schema instead
+/// (`Name`, `TypeDefHandle`, `VarData`) reads the type-definition header
+/// bytes as a `TypeDefHandle` index and then lands on a garbage `VarData`
+/// count ("array element count -32 exceeds cap"), which is how every
+/// `NiagaraComponent` / `ScorchEffectComponent` export in Anvil fell back
+/// to Opaque. Returns `None` for any other struct name.
+fn read_niagara_variable(
+    cur: &mut Cursor<&[u8]>,
+    struct_name: &Arc<str>,
+    usmap: &Usmap,
+    ctx: &AssetContext,
+    asset_path: &str,
+    depth: usize,
+) -> crate::Result<Option<PropertyValue>> {
+    let tail = match struct_name.as_ref() {
+        "NiagaraVariableBase" => None,
+        "NiagaraVariable" => Some("VarData"),
+        "NiagaraVariableWithOffset" => Some("Offset"),
+        _ => return Ok(None),
+    };
+    let value_eof = || truncated_at(asset_path, AssetWireField::UnversionedValue);
+    let field = |name: &str, value: PropertyValue| Property {
+        name: Arc::from(name),
+        array_index: 0,
+        guid: None,
+        value,
+    };
+    let name = read_fname_pair(cur, ctx, asset_path, AssetWireField::PropertyTagName)?;
+    let type_def = read_unversioned_properties(
+        cur,
+        "NiagaraTypeDefinition",
+        usmap,
+        ctx,
+        asset_path,
+        depth + 1,
+    )?;
+    let mut properties = vec![
+        field("Name", PropertyValue::Name(name)),
+        field(
+            "TypeDef",
+            PropertyValue::Struct {
+                struct_name: Arc::from("NiagaraTypeDefinition"),
+                properties: type_def,
+            },
+        ),
+    ];
+    match tail {
+        Some("VarData") => {
+            let count = read_collection_count(
+                cur,
+                asset_path,
+                AssetWireField::ArrayElementCount,
+                CollectionKind::Array,
+            )?;
+            let mut elements: Vec<PropertyValue> = Vec::new();
+            try_reserve_asset(
+                &mut elements,
+                count,
+                asset_path,
+                AssetSeam::CollectionElements,
+            )?;
+            for _ in 0..count {
+                elements.push(PropertyValue::Byte(cur.read_u8().map_err(|_| value_eof())?));
+            }
+            properties.push(field(
+                "VarData",
+                PropertyValue::Array {
+                    inner_type: intern_wire_name(mapped_type_wire_name(&MappedPropertyType::UInt8)),
+                    elements,
+                },
+            ));
+        }
+        Some(_) => {
+            let offset = cur.read_i32::<LE>().map_err(|_| value_eof())?;
+            properties.push(field("Offset", PropertyValue::Int(offset)));
+        }
+        None => {}
+    }
+    Ok(Some(PropertyValue::Struct {
+        struct_name: Arc::clone(struct_name),
+        properties,
+    }))
 }
 
 fn synthetic_element(inner: &MappedPropertyType) -> MappedProperty {
@@ -1091,6 +1187,109 @@ mod tests {
             matches!(color.value, PropertyValue::Int(99)),
             "Color should be Int(99) — under the bug it gets the wrong fragment or never decodes"
         );
+    }
+
+    #[test]
+    fn niagara_variable_reads_custom_blob_not_usmap_schema() {
+        // `FNiagaraVariable` is `WithSerializer`: Name, then the
+        // `NiagaraTypeDefinition` as unversioned properties, then
+        // `TArray<uint8> VarData`. The usmap still lists the struct's
+        // reflected properties (Name / TypeDefHandle / VarData); following
+        // them misreads the type-definition header as `TypeDefHandle` and
+        // lands on a garbage `VarData` count.
+        let prop = |name: &str, schema_index: u16, prop_type: MappedPropertyType| MappedProperty {
+            name: Arc::from(name),
+            schema_index,
+            array_index: 0,
+            prop_type,
+        };
+        let schema = |name: &str, properties: Vec<MappedProperty>| ClassSchema {
+            name: name.to_string(),
+            super_type: None,
+            prop_count: u16::try_from(properties.len()).expect("small"),
+            properties,
+        };
+        let mut schemas = HashMap::new();
+        let _ = schemas.insert(
+            "Holder".to_string(),
+            schema(
+                "Holder",
+                vec![prop(
+                    "Var",
+                    0,
+                    MappedPropertyType::Struct {
+                        struct_name: Arc::from("NiagaraVariable"),
+                    },
+                )],
+            ),
+        );
+        let _ = schemas.insert(
+            "NiagaraVariable".to_string(),
+            schema(
+                "NiagaraVariable",
+                vec![
+                    prop("Name", 0, MappedPropertyType::Name),
+                    prop(
+                        "TypeDefHandle",
+                        1,
+                        MappedPropertyType::Struct {
+                            struct_name: Arc::from("NiagaraTypeDefinitionHandle"),
+                        },
+                    ),
+                    prop(
+                        "VarData",
+                        2,
+                        MappedPropertyType::Array {
+                            inner: Arc::new(MappedPropertyType::UInt8),
+                        },
+                    ),
+                ],
+            ),
+        );
+        let _ = schemas.insert(
+            "NiagaraTypeDefinition".to_string(),
+            schema(
+                "NiagaraTypeDefinition",
+                vec![prop("UnderlyingType", 0, MappedPropertyType::UInt16)],
+            ),
+        );
+        let usmap = Usmap::from_parts(schemas, HashMap::new()).expect("from_parts");
+
+        let one_prop_header = 0x0300u16.to_le_bytes(); // is_last | value_num=1
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&one_prop_header); // Holder header
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // Name index -> "Max"
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // Name number
+        bytes.extend_from_slice(&one_prop_header); // NiagaraTypeDefinition header
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // UnderlyingType
+        bytes.extend_from_slice(&2i32.to_le_bytes()); // VarData count
+        bytes.extend_from_slice(&[7u8, 9u8]);
+
+        let ctx = make_ctx(&["None", "Max"]);
+        let mut cur = Cursor::new(bytes.as_slice());
+        let props = read_unversioned_properties(&mut cur, "Holder", &usmap, &ctx, "test", 0)
+            .expect("read_unversioned_properties");
+        assert_eq!(cur.position(), bytes.len() as u64, "whole blob consumed");
+        let PropertyValue::Struct {
+            struct_name,
+            properties,
+        } = &props[0].value
+        else {
+            panic!("expected Struct, got {:?}", props[0].value);
+        };
+        assert_eq!(struct_name.as_ref(), "NiagaraVariable");
+        assert!(matches!(&properties[0].value, PropertyValue::Name(n) if n.as_ref() == "Max"));
+        let PropertyValue::Struct { properties: td, .. } = &properties[1].value else {
+            panic!("expected TypeDef struct");
+        };
+        assert!(matches!(td[0].value, PropertyValue::UInt16(2)));
+        let PropertyValue::Array { elements, .. } = &properties[2].value else {
+            panic!("expected VarData array");
+        };
+        assert!(matches!(
+            elements.as_slice(),
+            [PropertyValue::Byte(7), PropertyValue::Byte(9)]
+        ));
     }
 
     #[test]
