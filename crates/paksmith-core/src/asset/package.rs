@@ -665,7 +665,8 @@ impl Package {
         let stitched = Arc::new(buf);
         let bytes: &[u8] = &stitched;
         let mut cursor = Cursor::new(bytes);
-        let summary = PackageSummary::read_from(&mut cursor, asset_path)?;
+        let summary =
+            PackageSummary::read_from_with_hint(&mut cursor, asset_path, opts.engine_version_hint)?;
 
         // UE 5.2+ object data-resource table (#642). When populated, it
         // governs bulk resolution package-wide: every `FByteBulkData`
@@ -862,17 +863,37 @@ impl Package {
             // many slots, elements or exports name resolves once per name
             // allocation.
             let mut view = UsmapView::new(usmap);
-            for export in &exports.exports {
+            let mut bulk_records: ExportBulkRecords = Vec::new();
+            for (export_idx, export) in exports.exports.iter().enumerate() {
                 // Propagate OOB errors here rather than swallowing them
                 // with `unwrap_or_default()`. `PackageIndex::Null`
                 // resolves to an empty name, so null class refs flow
                 // through cleanly and `class_properties` returns an
                 // empty schema (handled inside the decoder).
-                let class_name = crate::asset::property::primitives::resolve_package_index(
+                let mut class_name = crate::asset::property::primitives::resolve_package_index(
                     export.class_index,
                     &ctx,
                     asset_path,
                 )?;
+                // Two Blueprint assets can generate classes with the same
+                // bare name; the usmap then also registers each schema
+                // under `Class@Super` (see `disambiguated_schema_key`).
+                // When the class is an export of this package its
+                // `super_index` tells us which one applies.
+                if let crate::PackageIndex::Export(class_export) = export.class_index
+                    && let Some(class_export) = exports.exports.get(class_export as usize)
+                {
+                    let super_name = crate::asset::property::primitives::resolve_package_index(
+                        class_export.super_index,
+                        &ctx,
+                        asset_path,
+                    )?;
+                    let key =
+                        crate::asset::mappings::disambiguated_schema_key(&class_name, &super_name);
+                    if usmap.schemas.contains_key(&key) {
+                        class_name = std::sync::Arc::from(key);
+                    }
+                }
                 let export_slice = carve_export_slice(bytes, export, asset_path)?;
                 let schema = view.class_properties(&class_name, asset_path)?;
 
@@ -891,11 +912,18 @@ impl Package {
                 // is a later phase; until then unversioned typed-class
                 // exports parse as `Generic`.)
                 let mut export_cur = Cursor::new(export_slice);
-                // NOTE: a schema-parse failure here propagates (no Opaque
-                // fallback) — an unversioned parse error usually signals a
-                // wrong/mismatched `.usmap`, which should fail loudly
-                // rather than silently degrade.
-                let props = read_unversioned_properties(
+                // A schema-parse failure degrades THIS export to
+                // `PropertyBag::Opaque` (warn-level) instead of failing the
+                // whole package, mirroring the versioned path in
+                // `read_payloads`. Blueprint packages routinely carry
+                // engine components whose structs are natively serialised
+                // (e.g. `NiagaraComponent.OverrideParameters`, an
+                // `FNiagaraParameterStore`) and therefore cannot be decoded
+                // from the usmap schema; losing one such component must not
+                // hide the CDO and every other export. Only an allocation
+                // failure — an environmental error, not a corrupt export —
+                // still propagates.
+                let props = match read_unversioned_properties(
                     &mut export_cur,
                     &class_name,
                     schema,
@@ -903,13 +931,68 @@ impl Package {
                     &ctx,
                     asset_path,
                     0,
-                )?;
-                payloads.push(super::Asset::Generic(PropertyBag::tree(props)));
+                ) {
+                    Ok(props) => props,
+                    Err(err)
+                        if matches!(
+                            &err,
+                            PaksmithError::AssetParse {
+                                fault: AssetParseFault::AllocationFailed { .. },
+                                ..
+                            }
+                        ) =>
+                    {
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            asset = asset_path,
+                            export = export.object_name,
+                            export.class = &*crate::untrusted::clamp(&class_name),
+                            error = err.to_string(),
+                            "unversioned property decode failed, falling back to Opaque"
+                        );
+                        let mut buf: Vec<u8> = Vec::new();
+                        try_reserve_asset(
+                            &mut buf,
+                            export_slice.len(),
+                            asset_path,
+                            AssetSeam::ExportPayloadBytes,
+                        )?;
+                        buf.extend_from_slice(export_slice);
+                        payloads.push(super::Asset::Generic(PropertyBag::opaque(buf)));
+                        continue;
+                    }
+                };
+                if &*class_name == "DataTable" {
+                    // Typed DataTable rows for unversioned packages.
+                    let dt = crate::asset::exports::data_table::read_rows_unversioned(
+                        &mut export_cur,
+                        props,
+                        &mut view,
+                        &ctx,
+                        asset_path,
+                    )?;
+                    payloads.push(super::Asset::DataTable(dt));
+                } else if let Some(kind) = texture_kind_for_class(&class_name) {
+                    let total_len = export_slice.len() as u64;
+                    let (data, records) = crate::asset::exports::texture::texture2d::read_tail(
+                        &mut export_cur,
+                        total_len,
+                        &ctx,
+                        asset_path,
+                        kind,
+                        props,
+                    )?;
+                    payloads.push(super::Asset::Texture2D(data));
+                    if !records.is_empty() {
+                        bulk_records.push((export_idx, records));
+                    }
+                } else {
+                    payloads.push(super::Asset::Generic(PropertyBag::tree(props)));
+                }
             }
-            // Unversioned bodies never reach typed dispatch (they're
-            // schema-serialized, not tagged), so they surface no bulk
-            // records.
-            (payloads, Vec::new())
+            (payloads, bulk_records)
         } else {
             read_payloads(bytes, &exports, &ctx, asset_path)?
         };
@@ -1400,6 +1483,19 @@ fn check_export_payload_total(
 /// Per-export `FByteBulkData` records surfaced by typed readers, paired
 /// with the export index they belong to (`payloads[idx]`). Fed to
 /// `Package::insert_bulk_records` so `resolve_bulk_for_export` lines up.
+/// Texture classes the unversioned-properties branch routes to the typed
+/// texture tail reader (mirrors the class names registered in
+/// `exports::dispatch` for the versioned path).
+fn texture_kind_for_class(class_name: &str) -> Option<super::TextureKind> {
+    match class_name {
+        "Texture2D" => Some(super::TextureKind::TwoD),
+        "TextureCube" => Some(super::TextureKind::Cube),
+        "Texture2DArray" => Some(super::TextureKind::Array),
+        "VolumeTexture" => Some(super::TextureKind::Volume),
+        _ => None,
+    }
+}
+
 type ExportBulkRecords = Vec<(usize, Vec<FByteBulkData>)>;
 
 fn read_payloads(

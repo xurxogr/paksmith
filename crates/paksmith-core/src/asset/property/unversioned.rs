@@ -21,6 +21,7 @@ use std::io::{Cursor, Read};
 use std::sync::{Arc, LazyLock};
 
 use byteorder::{LE, ReadBytesExt};
+use tracing::trace;
 
 use crate::asset::name_table::allocation_address;
 use crate::asset::package_index::PackageIndex;
@@ -285,6 +286,19 @@ pub(crate) fn read_unversioned_properties(
     }
 
     if all_props.is_empty() {
+        // A struct that IS in the .usmap but declares no properties
+        // (e.g. `PointerToUberGraphFrame`, the transient frame pointer
+        // every Blueprint CDO carries) still goes through
+        // `SerializeUnversionedProperties`, which writes an empty
+        // header: one fragment, zero values, `bIsLast` set (`00 01`).
+        // Read that header so the cursor lands on the next property
+        // — Anvil's `BPVisWaterWheel` CDO has `UberGraphFrame`
+        // serialised and every following property is off by two bytes
+        // otherwise.
+        if view.has_schema(class_name) {
+            let _ = UnversionedHeader::read(cur, asset_path)?;
+            return Ok(Vec::new());
+        }
         // At depth 0 the export simply has no schema — emit an empty
         // bag (the outermost class lookup may resolve to `""` for
         // `PackageIndex::Null`, which we treat as "skip this export"
@@ -336,6 +350,14 @@ pub(crate) fn read_unversioned_properties(
             continue;
         }
         let mapped_prop = &resolved.property;
+        trace!(
+            class_name,
+            depth,
+            property = mapped_prop.name.as_ref(),
+            ty = ?mapped_prop.prop_type,
+            pos = cur.position(),
+            "unversioned property"
+        );
 
         match read_unversioned_value(cur, mapped_prop, view, ctx, asset_path, depth) {
             Ok(value) => {
@@ -491,6 +513,12 @@ impl<'u> UsmapView<'u> {
         )
     }
 
+    /// Whether the `.usmap` has a schema named `name`, even one that
+    /// declares no properties.
+    fn has_schema(&self, name: &str) -> bool {
+        self.usmap.schemas.contains_key(name)
+    }
+
     /// The `.usmap` properties of the class `class_name` names, empty when
     /// the `.usmap` has none.
     ///
@@ -642,9 +670,26 @@ fn read_unversioned_value(
             PropertyValue::Text(text)
         }
         MT::Enum { enum_name } => {
-            // Per CUE4Parse's EnumProperty constructor (`HasUnversionedProperties
-            // && type == NORMAL`): a single u8 ordinal — the default ByteProperty
-            // storage. Non-byte underlying types are rare and deferred.
+            // Per CUE4Parse's EnumProperty constructor: a top-level (or
+            // struct-member) enum in an unversioned package is a single u8
+            // ordinal (`HasUnversionedProperties && type == NORMAL`), but a
+            // collection element / map key / map value (`type == ARRAY |
+            // MAP`) is serialized by the property's own `SerializeItem`,
+            // which writes the qualified value name (`EEnum::Value`) as an
+            // FName. Container elements come through `synthetic_element`,
+            // whose marker is the empty property name.
+            if prop.name.is_empty() {
+                let qualified =
+                    read_fname_pair(cur, ctx, asset_path, AssetWireField::PropertyTagName)?;
+                let short: Arc<str> = match qualified.rsplit_once("::") {
+                    Some((_, tail)) => Arc::from(tail),
+                    None => Arc::clone(&qualified),
+                };
+                return Ok(PropertyValue::Enum {
+                    type_name: Arc::clone(enum_name),
+                    value: EnumValue::Named(short),
+                });
+            }
             let idx = cur.read_u8().map_err(|_| value_eof())?;
             // A name the `.usmap` has is shared; an ordinal it has no name
             // for keeps the enum's name by refcount rather than formatting a
@@ -691,42 +736,52 @@ fn read_unversioned_value(
                 sub_path,
             }
         }
-        MT::Struct { struct_name } => match view.struct_layout(struct_name, asset_path)? {
-            // The unversioned reader has no per-property `tag.size`; the
-            // decoder's `expected_end` is computed from the registry's
-            // version-deterministic `wire_size` (the natural width),
-            // matching the 3g/3h mesh-parser pattern. This single arm
-            // also serves Array/Set/Map elements, so container elements
-            // typed-decode with a PER-ELEMENT boundary — sidestepping
-            // the tagged path's whole-array `expected_end` hazard
-            // (`containers::read_struct_property` doc).
-            StructLayout::Typed(entry) => {
-                // Plain add, matching the 3g/3h callers (`FBox::read_from`,
-                // `render_data.rs`): `position()` is bounded by the
-                // in-memory slice length and `wire_size` is <= 49, so the
-                // u64 add cannot overflow.
-                let expected_end = cur.position() + (entry.wire_size)(ctx);
-                let typed = (entry.decoder)(cur, ctx, expected_end, asset_path)?;
-                PropertyValue::TypedStruct(Box::new(typed))
+        MT::Struct { struct_name } => {
+            if let Some(native) = read_native_struct(cur, struct_name, asset_path)? {
+                return Ok(native);
             }
-            // Unregistered struct: recurse the usmap property-list
-            // schema (CUE4Parse's `FStructFallback` equivalent). A
-            // missing schema fires `UnversionedSchemaMissing` →
-            // partial-tree stop.
-            StructLayout::Schema(schema) => PropertyValue::Struct {
-                properties: read_unversioned_properties(
-                    cur,
-                    struct_name,
-                    schema,
-                    view,
-                    ctx,
-                    asset_path,
-                    depth + 1,
-                )?,
-                // Refcount-bump (#365).
-                struct_name: Arc::clone(struct_name),
-            },
-        },
+            if let Some(native) =
+                read_niagara_variable(cur, struct_name, view, ctx, asset_path, depth)?
+            {
+                return Ok(native);
+            }
+            match view.struct_layout(struct_name, asset_path)? {
+                // The unversioned reader has no per-property `tag.size`; the
+                // decoder's `expected_end` is computed from the registry's
+                // version-deterministic `wire_size` (the natural width),
+                // matching the 3g/3h mesh-parser pattern. This single arm
+                // also serves Array/Set/Map elements, so container elements
+                // typed-decode with a PER-ELEMENT boundary — sidestepping
+                // the tagged path's whole-array `expected_end` hazard
+                // (`containers::read_struct_property` doc).
+                StructLayout::Typed(entry) => {
+                    // Plain add, matching the 3g/3h callers (`FBox::read_from`,
+                    // `render_data.rs`): `position()` is bounded by the
+                    // in-memory slice length and `wire_size` is <= 49, so the
+                    // u64 add cannot overflow.
+                    let expected_end = cur.position() + (entry.wire_size)(ctx);
+                    let typed = (entry.decoder)(cur, ctx, expected_end, asset_path)?;
+                    PropertyValue::TypedStruct(Box::new(typed))
+                }
+                // Unregistered struct: recurse the usmap property-list
+                // schema (CUE4Parse's `FStructFallback` equivalent). A
+                // missing schema fires `UnversionedSchemaMissing` →
+                // partial-tree stop.
+                StructLayout::Schema(schema) => PropertyValue::Struct {
+                    properties: read_unversioned_properties(
+                        cur,
+                        struct_name,
+                        schema,
+                        view,
+                        ctx,
+                        asset_path,
+                        depth + 1,
+                    )?,
+                    // Refcount-bump (#365).
+                    struct_name: Arc::clone(struct_name),
+                },
+            }
+        }
         MT::Array { inner } => {
             let count = read_collection_count(
                 cur,
@@ -869,6 +924,198 @@ fn read_unversioned_value(
 /// bodies carry no per-element `FPropertyTag`, so the type comes from the
 /// `.usmap` schema inner type; the name/index are irrelevant. Shared by
 /// the `Array` / `Set` / `Map` arms (#639).
+/// Engine structs that UE serializes atomically (`WithSerializer` /
+/// `WithStructuredSerializer`), so their bytes carry NO unversioned
+/// fragment header even inside an unversioned package. Reading them
+/// through the `.usmap` schema would misinterpret their first two bytes
+/// as a fragment header and under-consume the stream (the "bool32 value
+/// 65536" symptom on the object-guid tail). Mirrors the name switch in
+/// CUE4Parse's `FScriptStruct` for the structs the typed registry
+/// (`crate::asset::structs`) does not already cover. Returns `None` for
+/// any other struct name so the caller falls through to the registry /
+/// schema path.
+fn read_native_struct(
+    cur: &mut Cursor<&[u8]>,
+    struct_name: &Arc<str>,
+    asset_path: &str,
+) -> crate::Result<Option<PropertyValue>> {
+    let value_eof = || truncated_at(asset_path, AssetWireField::UnversionedValue);
+    let field = |name: &str, value: PropertyValue| Property {
+        name: Arc::from(name),
+        array_index: 0,
+        guid: None,
+        value,
+    };
+    let i32_field = |cur: &mut Cursor<&[u8]>, name: &str| -> crate::Result<Property> {
+        let v = cur.read_i32::<LE>().map_err(|_| value_eof())?;
+        Ok(field(name, PropertyValue::Int(v)))
+    };
+    let structure = |properties: Vec<Property>| PropertyValue::Struct {
+        struct_name: Arc::clone(struct_name),
+        properties,
+    };
+    let v = match struct_name.as_ref() {
+        "Guid" => {
+            let mut raw = [0u8; 16];
+            cur.read_exact(&mut raw).map_err(|_| value_eof())?;
+            let words: Vec<String> = raw
+                .chunks(4)
+                .map(|c| format!("{:08X}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect();
+            PropertyValue::Str(words.concat())
+        }
+        "IntPoint" => structure(vec![i32_field(cur, "X")?, i32_field(cur, "Y")?]),
+        "IntVector" => structure(vec![
+            i32_field(cur, "X")?,
+            i32_field(cur, "Y")?,
+            i32_field(cur, "Z")?,
+        ]),
+        "IntVector4" => structure(vec![
+            i32_field(cur, "X")?,
+            i32_field(cur, "Y")?,
+            i32_field(cur, "Z")?,
+            i32_field(cur, "W")?,
+        ]),
+        "FrameNumber" => structure(vec![i32_field(cur, "Value")?]),
+        "DateTime" | "Timespan" => {
+            let ticks = cur.read_i64::<LE>().map_err(|_| value_eof())?;
+            structure(vec![field("Ticks", PropertyValue::Int64(ticks))])
+        }
+        "PerPlatformFloat"
+        | "PerPlatformInt"
+        | "PerPlatformBool"
+        | "PerQualityLevelInt"
+        | "PerQualityLevelFloat" => {
+            // `bool bCooked` (bool32) then `Default`; the per-platform /
+            // per-quality override map only follows when NOT cooked.
+            let cooked = cur.read_i32::<LE>().map_err(|_| value_eof())? != 0;
+            let default = match struct_name.as_ref() {
+                "PerPlatformFloat" | "PerQualityLevelFloat" => {
+                    PropertyValue::Float(cur.read_f32::<LE>().map_err(|_| value_eof())?)
+                }
+                "PerPlatformBool" => {
+                    PropertyValue::Bool(cur.read_i32::<LE>().map_err(|_| value_eof())? != 0)
+                }
+                _ => PropertyValue::Int(cur.read_i32::<LE>().map_err(|_| value_eof())?),
+            };
+            if !cooked {
+                let count = cur.read_i32::<LE>().map_err(|_| value_eof())?;
+                let count = u64::try_from(count).map_err(|_| value_eof())?;
+                if count > 4096 {
+                    return Err(value_eof());
+                }
+                let key_len: u64 = if struct_name.starts_with("PerQuality") {
+                    4
+                } else {
+                    8
+                };
+                cur.set_position(cur.position() + (key_len + 4) * count);
+            }
+            structure(vec![field("Default", default)])
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
+/// Struct name of the type definition inside the `FNiagaraVariable`
+/// family, one allocation so [`UsmapView`] resolves its schema once.
+static NIAGARA_TYPE_DEFINITION: LazyLock<Arc<str>> =
+    LazyLock::new(|| Arc::from("NiagaraTypeDefinition"));
+
+/// `FNiagaraVariableBase` / `FNiagaraVariable` / `FNiagaraVariableWithOffset`
+/// carry `WithSerializer` in the engine, so a cooked package holds a hand
+/// written blob instead of the usmap property list: `Name` (FName), the
+/// `FNiagaraTypeDefinition` as ordinary unversioned properties (its own
+/// header included), then `VarData` (`TArray<uint8>`) for `FNiagaraVariable`
+/// or `Offset` (`int32`) for `FNiagaraVariableWithOffset`. Mirrors
+/// CUE4Parse's `FNiagaraVariableBase` / `FNiagaraVariable` /
+/// `FNiagaraVariableWithOffset` classes. Following the usmap schema instead
+/// (`Name`, `TypeDefHandle`, `VarData`) reads the type-definition header
+/// bytes as a `TypeDefHandle` index and then lands on a garbage `VarData`
+/// count ("array element count -32 exceeds cap"), which is how every
+/// `NiagaraComponent` / `ScorchEffectComponent` export in Anvil fell back
+/// to Opaque. Returns `None` for any other struct name.
+fn read_niagara_variable(
+    cur: &mut Cursor<&[u8]>,
+    struct_name: &Arc<str>,
+    view: &mut UsmapView<'_>,
+    ctx: &AssetContext,
+    asset_path: &str,
+    depth: usize,
+) -> crate::Result<Option<PropertyValue>> {
+    let tail = match struct_name.as_ref() {
+        "NiagaraVariableBase" => None,
+        "NiagaraVariable" => Some("VarData"),
+        "NiagaraVariableWithOffset" => Some("Offset"),
+        _ => return Ok(None),
+    };
+    let value_eof = || truncated_at(asset_path, AssetWireField::UnversionedValue);
+    let field = |name: &str, value: PropertyValue| Property {
+        name: Arc::from(name),
+        array_index: 0,
+        guid: None,
+        value,
+    };
+    let name = read_fname_pair(cur, ctx, asset_path, AssetWireField::PropertyTagName)?;
+    let type_def_schema = view.class_properties(&NIAGARA_TYPE_DEFINITION, asset_path)?;
+    let type_def = read_unversioned_properties(
+        cur,
+        &NIAGARA_TYPE_DEFINITION,
+        type_def_schema,
+        view,
+        ctx,
+        asset_path,
+        depth + 1,
+    )?;
+    let mut properties = vec![
+        field("Name", PropertyValue::Name(name)),
+        field(
+            "TypeDef",
+            PropertyValue::Struct {
+                struct_name: Arc::clone(&NIAGARA_TYPE_DEFINITION),
+                properties: type_def,
+            },
+        ),
+    ];
+    match tail {
+        Some("VarData") => {
+            let count = read_collection_count(
+                cur,
+                asset_path,
+                AssetWireField::ArrayElementCount,
+                CollectionKind::Array,
+            )?;
+            let mut elements: Vec<PropertyValue> = Vec::new();
+            try_reserve_asset(
+                &mut elements,
+                count,
+                asset_path,
+                AssetSeam::CollectionElements,
+            )?;
+            for _ in 0..count {
+                elements.push(PropertyValue::Byte(cur.read_u8().map_err(|_| value_eof())?));
+            }
+            properties.push(field(
+                "VarData",
+                PropertyValue::Array {
+                    inner_type: intern_wire_name(mapped_type_wire_name(&MappedPropertyType::UInt8)),
+                    elements,
+                },
+            ));
+        }
+        Some(_) => {
+            let offset = cur.read_i32::<LE>().map_err(|_| value_eof())?;
+            properties.push(field("Offset", PropertyValue::Int(offset)));
+        }
+        None => {}
+    }
+    Ok(Some(PropertyValue::Struct {
+        struct_name: Arc::clone(struct_name),
+        properties,
+    }))
+}
+
 fn synthetic_element(inner: &MappedPropertyType) -> MappedProperty {
     MappedProperty {
         // Shared empty Arc — refcount bump, not a fresh allocation.
@@ -1160,6 +1407,109 @@ mod tests {
             matches!(color.value, PropertyValue::Int(99)),
             "Color should be Int(99) — under the bug it gets the wrong fragment or never decodes"
         );
+    }
+
+    #[test]
+    fn niagara_variable_reads_custom_blob_not_usmap_schema() {
+        // `FNiagaraVariable` is `WithSerializer`: Name, then the
+        // `NiagaraTypeDefinition` as unversioned properties, then
+        // `TArray<uint8> VarData`. The usmap still lists the struct's
+        // reflected properties (Name / TypeDefHandle / VarData); following
+        // them misreads the type-definition header as `TypeDefHandle` and
+        // lands on a garbage `VarData` count.
+        let prop = |name: &str, schema_index: u16, prop_type: MappedPropertyType| MappedProperty {
+            name: Arc::from(name),
+            schema_index,
+            array_index: 0,
+            prop_type,
+        };
+        let schema = |name: &str, properties: Vec<MappedProperty>| ClassSchema {
+            name: name.to_string(),
+            super_type: None,
+            prop_count: u16::try_from(properties.len()).expect("small"),
+            properties,
+        };
+        let mut schemas = HashMap::new();
+        let _ = schemas.insert(
+            "Holder".to_string(),
+            schema(
+                "Holder",
+                vec![prop(
+                    "Var",
+                    0,
+                    MappedPropertyType::Struct {
+                        struct_name: Arc::from("NiagaraVariable"),
+                    },
+                )],
+            ),
+        );
+        let _ = schemas.insert(
+            "NiagaraVariable".to_string(),
+            schema(
+                "NiagaraVariable",
+                vec![
+                    prop("Name", 0, MappedPropertyType::Name),
+                    prop(
+                        "TypeDefHandle",
+                        1,
+                        MappedPropertyType::Struct {
+                            struct_name: Arc::from("NiagaraTypeDefinitionHandle"),
+                        },
+                    ),
+                    prop(
+                        "VarData",
+                        2,
+                        MappedPropertyType::Array {
+                            inner: Arc::new(MappedPropertyType::UInt8),
+                        },
+                    ),
+                ],
+            ),
+        );
+        let _ = schemas.insert(
+            "NiagaraTypeDefinition".to_string(),
+            schema(
+                "NiagaraTypeDefinition",
+                vec![prop("UnderlyingType", 0, MappedPropertyType::UInt16)],
+            ),
+        );
+        let usmap = Usmap::from_parts(schemas, HashMap::new()).expect("from_parts");
+
+        let one_prop_header = 0x0300u16.to_le_bytes(); // is_last | value_num=1
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&one_prop_header); // Holder header
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // Name index -> "Max"
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // Name number
+        bytes.extend_from_slice(&one_prop_header); // NiagaraTypeDefinition header
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // UnderlyingType
+        bytes.extend_from_slice(&2i32.to_le_bytes()); // VarData count
+        bytes.extend_from_slice(&[7u8, 9u8]);
+
+        let ctx = make_ctx(&["None", "Max"]);
+        let mut cur = Cursor::new(bytes.as_slice());
+        let props = read_unversioned_properties(&mut cur, "Holder", &usmap, &ctx, "test", 0)
+            .expect("read_unversioned_properties");
+        assert_eq!(cur.position(), bytes.len() as u64, "whole blob consumed");
+        let PropertyValue::Struct {
+            struct_name,
+            properties,
+        } = &props[0].value
+        else {
+            panic!("expected Struct, got {:?}", props[0].value);
+        };
+        assert_eq!(struct_name.as_ref(), "NiagaraVariable");
+        assert!(matches!(&properties[0].value, PropertyValue::Name(n) if n.as_ref() == "Max"));
+        let PropertyValue::Struct { properties: td, .. } = &properties[1].value else {
+            panic!("expected TypeDef struct");
+        };
+        assert!(matches!(td[0].value, PropertyValue::UInt16(2)));
+        let PropertyValue::Array { elements, .. } = &properties[2].value else {
+            panic!("expected VarData array");
+        };
+        assert!(matches!(
+            elements.as_slice(),
+            [PropertyValue::Byte(7), PropertyValue::Byte(9)]
+        ));
     }
 
     #[test]
@@ -1859,29 +2209,51 @@ mod tests {
         usmap: &Usmap,
         depth: usize,
     ) -> crate::Result<PropertyValue> {
+        read_value_named(prop_type, wire, usmap, &["None"], depth)
+    }
+
+    /// `wire` read against `usmap` as a property of type `prop_type`, at
+    /// `depth`, with `names` as the package's name table.
+    fn read_value_named(
+        prop_type: MappedPropertyType,
+        wire: &[u8],
+        usmap: &Usmap,
+        names: &[&str],
+        depth: usize,
+    ) -> crate::Result<PropertyValue> {
         let prop = MappedProperty {
             name: Arc::from("P"),
             schema_index: 0,
             array_index: 0,
             prop_type,
         };
-        let ctx = make_ctx(&["None"]);
+        let ctx = make_ctx(names);
         let view = &mut UsmapView::new(usmap);
         read_unversioned_value(&mut Cursor::new(wire), &prop, view, &ctx, "t", depth)
     }
 
-    /// `wire` decoded against `usmap` as a top-level property of type
-    /// `prop_type`.
-    fn decode_value(prop_type: MappedPropertyType, wire: &[u8], usmap: &Usmap) -> PropertyValue {
-        read_value(prop_type, wire, usmap, 0).unwrap()
+    /// The package name table the container enum tests read their elements
+    /// from: two qualified value names and a bare one.
+    const ENUM_ELEMENT_NAMES: [&str; 4] = ["None", "Difficulty::Easy", "Difficulty::Hard", "Hard"];
+
+    /// The wire form of a container enum element: an FName pair naming
+    /// slot `idx` of [`ENUM_ELEMENT_NAMES`].
+    fn enum_element(idx: u8) -> [u8; 8] {
+        [idx, 0, 0, 0, 0, 0, 0, 0]
     }
 
-    /// Enum elements of an Array, a Set and a Map decode to the `.usmap`'s
-    /// value names.
+    /// `wire` decoded against `usmap` as a top-level property of type
+    /// `prop_type`, its FNames resolving through [`ENUM_ELEMENT_NAMES`].
+    fn decode_elements(prop_type: MappedPropertyType, wire: &[u8], usmap: &Usmap) -> PropertyValue {
+        read_value_named(prop_type, wire, usmap, &ENUM_ELEMENT_NAMES, 0).unwrap()
+    }
+
+    /// Enum elements of an Array, a Set and a Map are serialized as the
+    /// value's FName and decode to the name past the `EEnum::` qualifier.
     #[test]
     fn container_enum_elements_decode_to_their_names() {
         let usmap = difficulty_usmap();
-        let decode = |prop_type, wire: &[u8]| decode_value(prop_type, wire, &usmap);
+        let decode = |prop_type, wire: &[u8]| decode_elements(prop_type, wire, &usmap);
         let named = |value: &PropertyValue| match value {
             PropertyValue::Enum {
                 value: EnumValue::Named(name),
@@ -1894,7 +2266,7 @@ mod tests {
             MappedPropertyType::Array {
                 inner: difficulty(),
             },
-            &[2, 0, 0, 0, 1, 0],
+            &[&[2, 0, 0, 0][..], &enum_element(2), &enum_element(1)].concat(),
         );
         let PropertyValue::Array { elements, .. } = array else {
             panic!("expected an array, got {array:?}");
@@ -1908,7 +2280,7 @@ mod tests {
             MappedPropertyType::Set {
                 inner: difficulty(),
             },
-            &[0, 0, 0, 0, 1, 0, 0, 0, 1],
+            &[&[0, 0, 0, 0, 1, 0, 0, 0][..], &enum_element(3)].concat(),
         );
         let PropertyValue::Set { elements, .. } = set else {
             panic!("expected a set, got {set:?}");
@@ -1920,7 +2292,12 @@ mod tests {
                 key: difficulty(),
                 value: difficulty(),
             },
-            &[0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            &[
+                &[0, 0, 0, 0, 1, 0, 0, 0][..],
+                &enum_element(1),
+                &enum_element(2),
+            ]
+            .concat(),
         );
         let PropertyValue::Map { entries, .. } = map else {
             panic!("expected a map, got {map:?}");
@@ -1932,17 +2309,12 @@ mod tests {
         assert_eq!(pairs, [("Easy".to_string(), "Hard".to_string())]);
     }
 
-    /// A container looks its element enum's table up once for all its
-    /// elements (a Set's removed elements and a Map's removed keys included),
-    /// a Map once per allocation of the name its sides carry, nested
-    /// containers once for all their instances, and an empty container not
-    /// at all.
+    /// Container enum elements carry their value name on the wire, so a
+    /// container never looks the enum's value table up.
     #[cfg(feature = "__test_utils")]
     #[test]
-    fn containers_look_an_enum_table_up_once() {
+    fn container_enum_elements_skip_the_value_table() {
         let usmap = difficulty_usmap();
-        let lookups = enum_table_lookups;
-        let shared = difficulty();
         let array = || MappedPropertyType::Array {
             inner: difficulty(),
         };
@@ -1950,39 +2322,25 @@ mod tests {
             key: difficulty(),
             value: difficulty(),
         };
-        for (prop_type, wire, expected) in [
-            (array(), &[3, 0, 0, 0, 0, 1, 0][..], 1),
+        for (prop_type, wire) in [
             (
-                MappedPropertyType::Set {
-                    inner: difficulty(),
-                },
-                &[1, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0][..],
-                1,
-            ),
-            // Two allocations of the name, one per side.
-            (map(), &[1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0][..], 2),
-            (
-                MappedPropertyType::Map {
-                    key: Arc::clone(&shared),
-                    value: shared,
-                },
-                &[1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 0][..],
-                1,
+                array(),
+                [&[2, 0, 0, 0][..], &enum_element(1), &enum_element(2)].concat(),
             ),
             (
-                // Two inner arrays share the read's one lookup.
-                MappedPropertyType::Array {
-                    inner: Arc::new(array()),
-                },
-                &[2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1][..],
-                1,
+                map(),
+                [
+                    &[0, 0, 0, 0, 1, 0, 0, 0][..],
+                    &enum_element(1),
+                    &enum_element(2),
+                ]
+                .concat(),
             ),
-            (array(), &[0, 0, 0, 0][..], 0),
-            (map(), &[0, 0, 0, 0, 0, 0, 0, 0][..], 0),
+            (array(), vec![0, 0, 0, 0]),
         ] {
-            let before = lookups();
-            let _ = decode_value(prop_type, wire, &usmap);
-            assert_eq!(lookups() - before, expected, "{wire:?}");
+            let before = enum_table_lookups();
+            let _ = decode_elements(prop_type, &wire, &usmap);
+            assert_eq!(enum_table_lookups() - before, 0, "{wire:?}");
         }
     }
 
@@ -1999,19 +2357,49 @@ mod tests {
     }
 
     /// The memo reserves an entry on a miss and nothing on a hit: with its
-    /// seam armed to fail the first reservation, an array of one enum fails
-    /// the read; armed to fail the second, the three elements decode.
+    /// seam armed to fail the first reservation, a row of three slots of one
+    /// enum fails the read; armed to fail the second, the three slots decode.
     #[cfg(feature = "__test_utils")]
     #[test]
     fn the_memo_reserves_on_a_miss_and_not_on_a_hit() {
         let site = crate::seams::SeamSite::Asset(AssetSeam::EnumTableMemo);
-        let array = || MappedPropertyType::Array {
-            inner: difficulty(),
+        let difficulty = Arc::<str>::from("Difficulty");
+        let properties = (0u16..3)
+            .map(|index| MappedProperty {
+                name: Arc::from(format!("P{index}")),
+                schema_index: index,
+                array_index: 0,
+                prop_type: MappedPropertyType::Enum {
+                    enum_name: Arc::clone(&difficulty),
+                },
+            })
+            .collect();
+        let schema = ClassSchema {
+            name: "C".to_string(),
+            super_type: None,
+            prop_count: 3,
+            properties,
         };
-        let wire = [3, 0, 0, 0, 0, 1, 0];
+        let usmap = Usmap::from_parts(
+            HashMap::from([("C".to_string(), schema)]),
+            difficulty_usmap().enums,
+        )
+        .unwrap();
+        // One fragment, last, three values.
+        let wire = [0x00, 0x07, 0, 1, 0];
+        let read = || {
+            read_unversioned_properties(
+                &mut Cursor::new(&wire[..]),
+                "C",
+                &usmap,
+                &make_ctx(&["None"]),
+                "t",
+                0,
+            )
+        };
 
         let first = crate::testing::oom::arm_at(site, 0);
-        let err = read_value(array(), &wire, &difficulty_usmap(), 0).unwrap_err();
+        let err = read().unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2029,7 +2417,7 @@ mod tests {
         drop(first);
 
         let _second = crate::testing::oom::arm_at(site, 1);
-        assert!(read_value(array(), &wire, &difficulty_usmap(), 0).is_ok());
+        assert_eq!(read().unwrap().len(), 3);
     }
 
     /// The miss reserves the memo entry for real before the seam is

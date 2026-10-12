@@ -93,7 +93,7 @@ const MAX_INHERITANCE_DEPTH: usize = 64;
 /// 4096 is a wide safety margin.
 ///
 /// Exposed via [`max_usmap_enum_count`].
-const MAX_USMAP_ENUM_COUNT: u32 = 4_096;
+const MAX_USMAP_ENUM_COUNT: u32 = 65_536;
 
 /// Hard cap on per-enum `value_count`. `LargeEnums` (v3) widened the
 /// wire field to `u16` (65535 max); no real-world enum has that many
@@ -126,7 +126,7 @@ const MAX_USMAP_EXPANDED_PROPERTIES_PER_SCHEMA: u32 = 65_536;
 /// and matches the [`MAX_USMAP_ENUM_COUNT`] rationale.
 ///
 /// Exposed via [`max_usmap_schema_count`].
-const MAX_USMAP_SCHEMA_COUNT: u32 = 4_096;
+const MAX_USMAP_SCHEMA_COUNT: u32 = 262_144;
 
 /// Hard cap on the wire-claimed `name_count`. Without this cap the
 /// 256 MiB `MAX_USMAP_DECOMPRESSED_SIZE` budget alone permitted a
@@ -138,7 +138,7 @@ const MAX_USMAP_SCHEMA_COUNT: u32 = 4_096;
 /// to a single-digit-MiB slot reservation.
 ///
 /// Exposed via [`max_usmap_name_count`].
-const MAX_USMAP_NAME_COUNT: u32 = 131_072;
+const MAX_USMAP_NAME_COUNT: u32 = 2_097_152;
 
 /// Hard cap on the total entry count in the flattened-property cache
 /// (#370), summed across every class's flattened inheritance chain.
@@ -477,6 +477,16 @@ pub struct ClassSchema {
     pub prop_count: u16,
     /// Properties defined directly on this class (not inherited), in schema order.
     pub properties: Vec<MappedProperty>,
+}
+
+/// Key under which a class schema that shares its bare name with another
+/// one (`FoodTrough_C` generated both by `Structures/FoodTrough` and by
+/// `Structures/FootprintAssets/FoodTrough`) is also registered:
+/// `Class@Super`. The package reader knows the export's super class from
+/// its `BlueprintGeneratedClass` export and can pick the right schema.
+#[must_use]
+pub fn disambiguated_schema_key(class_name: &str, super_name: &str) -> String {
+    format!("{class_name}@{super_name}")
 }
 
 /// Parsed `.usmap` mappings file: a registry of class schemas plus the
@@ -1058,15 +1068,47 @@ impl Usmap {
                 }));
             }
 
-            let _ = schemas.insert(
-                copy_name(&name, ledger)?,
-                ClassSchema {
-                    name,
-                    super_type,
-                    prop_count,
-                    properties,
-                },
-            );
+            // Blueprint classes are keyed by bare name, so two assets
+            // whose generated class shares a name (Anvil ships
+            // `Structures/FoodTrough` and
+            // `Structures/FootprintAssets/FoodTrough`, both
+            // `FoodTrough_C`) collide here. The later schema takes the
+            // bare name and the earlier one stays reachable under
+            // `Class@Super`, which the package reader tries first.
+            let schema = ClassSchema {
+                name,
+                super_type,
+                prop_count,
+                properties,
+            };
+            if let Some(prev) = schemas.remove(&schema.name) {
+                tracing::debug!(
+                    schema = &*crate::untrusted::clamp(&schema.name),
+                    previous_super =
+                        &*crate::untrusted::clamp(prev.super_type.as_deref().unwrap_or("")),
+                    previous_props = prev.prop_count,
+                    new_super =
+                        &*crate::untrusted::clamp(schema.super_type.as_deref().unwrap_or("")),
+                    new_props = schema.prop_count,
+                    "duplicate class schema in .usmap; the later one keeps the bare name, \
+                     the earlier one moves to `Class@Super`"
+                );
+                let key = copy_name(
+                    &disambiguated_schema_key(
+                        &schema.name,
+                        prev.super_type.as_deref().unwrap_or(""),
+                    ),
+                    ledger,
+                )?;
+                ledger
+                    .heap_bytes
+                    .charge(table_bytes::<(String, ClassSchema)>(1))?;
+                schemas.try_reserve(1).map_err(|source| {
+                    mappings_alloc_failed(MappingsAllocationContext::SchemaTable, 1, source)
+                })?;
+                let _ = schemas.insert(key, prev);
+            }
+            let _ = schemas.insert(copy_name(&schema.name, ledger)?, schema);
         }
 
         // Pre-compute the flattened-property cache (#370). One walk
@@ -1342,6 +1384,11 @@ pub struct ResolvedProperty {
 /// even though the wire bytes were fully readable).
 fn read_name_arc(cur: &mut Cursor<&[u8]>, names: &[Arc<str>]) -> crate::Result<Arc<str>> {
     let idx = read_or_truncated(cur, |c| c.read_i32::<LE>())?;
+    // CUE4Parse `UsmapParser.ReadName`: index -1 is the null name ("no
+    // super type"); surface it as "None".
+    if idx == -1 {
+        return Ok(Arc::from("None"));
+    }
     #[allow(
         clippy::cast_sign_loss,
         reason = "negative indices wrap to a huge usize that fails the get() bounds check, surfacing as NameIndexOutOfRange"
@@ -1451,12 +1498,15 @@ fn read_mapped_type(
         10 => MappedPropertyType::Str,        // StrProperty
         11 => MappedPropertyType::Text,       // TextProperty
         17 => MappedPropertyType::SoftObject, // SoftObjectProperty (FSoftObjectPath: FName + FString)
-        // WeakObject (14), LazyObject (15), AssetObject (16) have distinct
-        // wire formats (LazyObject is a 16-byte FUniqueObjectGuid;
-        // WeakObject and AssetObject differ from SoftObject in subtle ways).
-        // Map them to Unknown so the reader emits UnversionedTypeNotSupported
-        // rather than silently misparsing FSoftObjectPath bytes.
-        14 | 15 | 16 => MappedPropertyType::Unknown(type_byte),
+        // WeakObject (14): FWeakObjectProperty::SerializeItem writes the
+        // pointed-to UObject* like ObjectProperty does, i.e. a 4-byte
+        // FPackageIndex in cooked packages (Anvil: `LeaderPoseComponent`
+        // on BPVisHorse). LazyObject (15) is a 16-byte FUniqueObjectGuid and
+        // AssetObject (16) differs from SoftObject in subtle ways; keep those
+        // Unknown so the reader emits UnversionedTypeNotSupported rather than
+        // silently misparsing the bytes.
+        14 => MappedPropertyType::Object,
+        15 | 16 => MappedPropertyType::Unknown(type_byte),
         18 => MappedPropertyType::UInt64, // UInt64Property
         19 => MappedPropertyType::UInt32, // UInt32Property
         20 => MappedPropertyType::UInt16, // UInt16Property
@@ -1482,13 +1532,19 @@ fn read_mapped_type(
             }
         }
         26 => {
-            // EnumProperty: inner type byte (always ByteProperty (0) in
-            // practice), then enum name
-            let _inner_byte = read_or_truncated(cur, |c| c.read_u8())?;
+            // EnumProperty: the inner type is a full recursive type node
+            // (ByteProperty in practice); parse it so the stream stays aligned.
+            let _inner = read_mapped_type(cur, names, depth + 1, ledger)?;
             let enum_name = read_name_arc(cur, names)?;
             MappedPropertyType::Enum { enum_name }
         }
         27 => MappedPropertyType::Unknown(type_byte), // FieldPathProperty
+        28 => {
+            // OptionalProperty (UE 5.4+): carries an inner type on the wire
+            // which MUST be consumed or the schema stream desyncs.
+            let _inner = read_mapped_type(cur, names, depth + 1, ledger)?;
+            MappedPropertyType::Unknown(type_byte)
+        }
         other => MappedPropertyType::Unknown(other),
     })
 }
@@ -2451,21 +2507,21 @@ mod tests {
 
     #[test]
     fn parse_usmap_name_index_negative_wire_value_rejected() {
-        // Negative i32 wire value (-1, encoded as `0xFF FF FF FF` LE)
-        // wraps to a huge `usize` on the cast and fails the
-        // `names.get()` bounds check, surfacing through the same
-        // `NameIndexOutOfRange` arm — but the variant payload
-        // carries the raw signed `-1`, not the wrapped positive.
+        // Negative i32 wire value other than the `-1` null name (-2,
+        // encoded as `0xFE FF FF FF` LE) wraps to a huge `usize` on the
+        // cast and fails the `names.get()` bounds check, surfacing
+        // through the same `NameIndexOutOfRange` arm — but the variant
+        // payload carries the raw signed `-2`, not the wrapped positive.
         // Pins the i32-carry design decision at the parser level
         // rather than only at Display.
-        let usmap = build_enum_oob_usmap(-1);
+        let usmap = build_enum_oob_usmap(-2);
 
         let err = Usmap::from_bytes(&usmap).unwrap_err();
         match err {
             crate::PaksmithError::MappingsParse {
                 fault: crate::error::MappingsParseFault::NameIndexOutOfRange { idx, table_len },
             } => {
-                assert_eq!(idx, -1, "wire i32 must surface verbatim, not wrapped");
+                assert_eq!(idx, -2, "wire i32 must surface verbatim, not wrapped");
                 assert_eq!(table_len, 2);
             }
             other => panic!("expected NameIndexOutOfRange, got {other:?}"),
