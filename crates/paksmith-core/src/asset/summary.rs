@@ -62,8 +62,8 @@ const MAX_CHUNK_ID_COUNT: i32 = 65_536;
 /// CUE4Parse's `EUnrealEngineObjectUE5Version` enum
 /// (`CUE4Parse/UE4/Versions/ObjectVersion.cs`):
 ///
-/// Accepted: 1000–1013 inclusive — UE 5.0 (1004) through UE 5.5
-/// (1013). The property-tag wire breaks at
+/// Accepted: 1000–1017 inclusive — UE 5.0 (1004) through UE 5.6
+/// (1017). The property-tag wire breaks at
 /// `PROPERTY_TAG_EXTENSION_AND_OVERRIDABLE_SERIALIZATION = 1011`
 /// (extension + serialization-control bytes) and
 /// `PROPERTY_TAG_COMPLETE_TYPE_NAME = 1012` (tree-based type names,
@@ -72,14 +72,14 @@ const MAX_CHUNK_ID_COUNT: i32 = 65_536;
 /// `ASSETREGISTRY_PACKAGEBUILDDEPENDENCIES = 1013` (UE 5.5) changes
 /// only the asset-registry blob, which paksmith does not parse.
 ///
-/// Rejected: 1014+ —
-/// - `METADATA_SERIALIZATION_OFFSET = 1014` adds a summary
-///   `MetaDataOffset` i32 the summary reader does not consume, which
-///   would desync every subsequent summary field.
-/// - `VERSE_CELLS = 1015` adds four cell-table summary fields;
-///   `PACKAGE_SAVED_HASH = 1016` replaces the summary's `FGuid` with
-///   an `FIoHash` and moves `TotalHeaderSize`.
-pub const FIRST_UNSUPPORTED_UE5_VERSION: i32 = 1014;
+/// The summary reader consumes the UE 5.6 additions:
+/// `METADATA_SERIALIZATION_OFFSET = 1014` (a `MetaDataOffset` i32),
+/// `VERSE_CELLS = 1015` (four cell-table fields) and
+/// `PACKAGE_SAVED_HASH = 1016` (an `FIoHash` in place of the `FGuid`,
+/// with `TotalHeaderSize` moved ahead of the custom versions).
+///
+/// Rejected: 1018+, past UE 5.6.
+pub const FIRST_UNSUPPORTED_UE5_VERSION: i32 = 1018;
 
 /// `PKG_FilterEditorOnly` — UE's `EPackageFlags` bit for "this archive
 /// was cooked and stripped of editor-only state". Cooked game archives
@@ -258,7 +258,7 @@ impl PackageSummary {
     /// - [`AssetParseFault::UnsupportedFileVersionUE4`] otherwise if
     ///   `file_version_ue4 < VER_UE4_NAME_HASHES_SERIALIZED` (504).
     /// - [`AssetParseFault::UnsupportedFileVersionUE5`] otherwise if
-    ///   `file_version_ue5 >= FIRST_UNSUPPORTED_UE5_VERSION` (1014).
+    ///   `file_version_ue5 >= FIRST_UNSUPPORTED_UE5_VERSION` (1018).
     /// - [`AssetParseFault::NegativeValue`] (with field
     ///   [`AssetWireField::TotalHeaderSize`], [`AssetWireField::GenerationCount`],
     ///   [`AssetWireField::AdditionalPackagesToCookCount`], or
@@ -326,6 +326,19 @@ impl PackageSummary {
     // chunk_id_count). Bit-preserving by construction.
     #[allow(clippy::cast_sign_loss)]
     pub fn read_from<R: Read>(reader: &mut R, asset_path: &str) -> crate::Result<Self> {
+        Self::read_from_with_hint(reader, asset_path, None)
+    }
+
+    /// Like `read_from`, but an engine-version hint
+    /// lets fully unversioned packages (UE4/UE5/licensee all 0) be read
+    /// by synthesising the object versions the way CUE4Parse's
+    /// `Ar.Ver = Ar.Game.GetVersion()` does.
+    #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
+    pub fn read_from_with_hint<R: Read>(
+        reader: &mut R,
+        asset_path: &str,
+        hint: Option<crate::asset::UeVersion>,
+    ) -> crate::Result<Self> {
         // Magic
         let tag = reader.read_u32::<LittleEndian>()?;
         if tag != PACKAGE_FILE_TAG {
@@ -338,18 +351,14 @@ impl PackageSummary {
             });
         }
         // Versions. Accepted window: -7 (UE 4.14-4.27), -8 (UE 5.0-5.5),
-        // and -9, which UE 5.6+ writes. The checks below still refuse
-        // every UE 5.6+ package: versioned ones at the UE5 ceiling,
-        // unversioned ones as unversioned. Per CUE4Parse's
+        // and -9, which UE 5.6+ writes. Per CUE4Parse's
         // FPackageFileSummary.cs@77b94fa (L138-L143), -9 introduces a
         // contract that loaders may need to early-exit on
         // FileVersionTooNew; the wire-format changes that ride at -9
         // (notably PACKAGE_SAVED_HASH at UE5 1016 swapping the summary's
-        // FGuid for an FIoHash) are gated by FileVersionUE5 floors at or
-        // above the ceiling, FIRST_UNSUPPORTED_UE5_VERSION (1014).
-        // -9 is therefore wire-compatible with -8 within paksmith's
-        // accepted UE5 range; widening the window is forward-compat
-        // only (no behavior change for existing -7/-8 inputs).
+        // FGuid for an FIoHash) are gated by FileVersionUE5 floors, below
+        // the ceiling FIRST_UNSUPPORTED_UE5_VERSION (1018). An unversioned
+        // package is refused unless an engine-version hint is given.
         let legacy_file_version = reader.read_i32::<LittleEndian>()?;
         if !matches!(legacy_file_version, -9..=-7) {
             return Err(PaksmithError::AssetParse {
@@ -360,7 +369,7 @@ impl PackageSummary {
             });
         }
         let _legacy_ue3_version = reader.read_i32::<LittleEndian>()?;
-        let file_version_ue4 = reader.read_i32::<LittleEndian>()?;
+        let mut file_version_ue4 = reader.read_i32::<LittleEndian>()?;
         // 0 may mean "not recorded" rather than "too old"; decided once
         // the UE5 and licensee versions are read.
         let ue4_recorded = file_version_ue4 != 0;
@@ -373,7 +382,7 @@ impl PackageSummary {
                 },
             });
         }
-        let file_version_ue5 = if legacy_file_version <= -8 {
+        let mut file_version_ue5 = if legacy_file_version <= -8 {
             Some(reader.read_i32::<LittleEndian>()?)
         } else {
             None
@@ -395,20 +404,39 @@ impl PackageSummary {
             // CUE4Parse's FPackageFileSummary applies the same test.
             let unversioned =
                 file_version_ue5.is_none_or(|v| v == 0) && file_version_licensee_ue4 == 0;
-            let fault = if unversioned {
-                AssetParseFault::UnversionedPackage {
-                    legacy_file_version,
+            match hint {
+                Some(h) if unversioned => {
+                    // Synthesise from the hint (CUE4Parse UEVersions.GetVersion).
+                    file_version_ue4 = 522;
+                    file_version_ue5 = match (h.major, h.minor) {
+                        (4, _) => None,
+                        (5, 0) => Some(1004),
+                        (5, 1) => Some(1008),
+                        (5, 2 | 3) => Some(1009),
+                        (5, 4) => Some(1012),
+                        (5, 5) => Some(1013),
+                        _ => Some(1017),
+                    };
+                    tracing::warn!(hint = h.to_string(), ue4 = file_version_ue4, ue5 = ?file_version_ue5,
+                        "unversioned package: object versions synthesised from engine hint");
                 }
-            } else {
-                AssetParseFault::UnsupportedFileVersionUE4 {
-                    version: 0,
-                    minimum: VER_UE4_NAME_HASHES_SERIALIZED,
+                _ => {
+                    let fault = if unversioned {
+                        AssetParseFault::UnversionedPackage {
+                            legacy_file_version,
+                        }
+                    } else {
+                        AssetParseFault::UnsupportedFileVersionUE4 {
+                            version: 0,
+                            minimum: VER_UE4_NAME_HASHES_SERIALIZED,
+                        }
+                    };
+                    return Err(PaksmithError::AssetParse {
+                        asset_path: asset_path.to_string(),
+                        fault,
+                    });
                 }
-            };
-            return Err(PaksmithError::AssetParse {
-                asset_path: asset_path.to_string(),
-                fault,
-            });
+            }
         }
         let version = AssetVersion {
             legacy_file_version,
@@ -417,11 +445,26 @@ impl PackageSummary {
             file_version_licensee_ue4,
         };
 
+        // UE5 1016 PACKAGE_SAVED_HASH: 20-byte FIoHash + TotalHeaderSize
+        // move BEFORE the custom-version container (CUE4Parse order,
+        // confirmed against Anvil Empires 5.6 bytes).
+        let mut saved_hash = [0u8; 20];
+        let total_header_size = if version.ue5_at_least(1016) {
+            reader.read_exact(&mut saved_hash)?;
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
+
         // Custom versions
         let custom_versions = CustomVersionContainer::read_from(reader, asset_path)?;
 
         // Header size + folder
-        let total_header_size = reader.read_i32::<LittleEndian>()?;
+        let total_header_size = if version.ue5_at_least(1016) {
+            total_header_size
+        } else {
+            reader.read_i32::<LittleEndian>()?
+        };
         if total_header_size < 0 {
             return Err(PaksmithError::AssetParse {
                 asset_path: asset_path.to_string(),
@@ -492,6 +535,14 @@ impl PackageSummary {
         let export_offset = reader.read_i32::<LittleEndian>()?;
         let import_count = reader.read_i32::<LittleEndian>()?;
         let import_offset = reader.read_i32::<LittleEndian>()?;
+        if version.ue5_at_least(1015) {
+            for _ in 0..4 {
+                let _cell = reader.read_i32::<LittleEndian>()?;
+            }
+        }
+        if version.ue5_at_least(1014) {
+            let _meta_data_offset = reader.read_i32::<LittleEndian>()?;
+        }
         let depends_offset = reader.read_i32::<LittleEndian>()?;
         let soft_package_references_count = reader.read_i32::<LittleEndian>()?;
         let soft_package_references_offset = reader.read_i32::<LittleEndian>()?;
@@ -522,7 +573,12 @@ impl PackageSummary {
         // Both GUIDs are skipped entirely on cooked-game input (the
         // common case for paksmith); `OwnerPersistentGuid` is further
         // restricted to a narrow uncooked window.
-        let guid = FGuid::read_from(reader)?;
+        let guid = if version.ue5_at_least(1016) {
+            let _ = saved_hash;
+            FGuid::from_bytes([0u8; 16])
+        } else {
+            FGuid::read_from(reader)?
+        };
         let editor_only_section = (package_flags & PKG_FILTER_EDITOR_ONLY) == 0;
         let persistent_guid =
             if editor_only_section && version.ue4_at_least(VER_UE4_ADDED_PACKAGE_OWNER) {
@@ -986,10 +1042,9 @@ mod tests {
         assert_eq!(parsed, s);
     }
 
-    /// `legacy_file_version = -9` is the UE 5.6+ marker. Within
-    /// paksmith's accepted UE5 ceiling (< 1014), -9 introduces no
-    /// new wire fields beyond what -8 emits (PACKAGE_SAVED_HASH is at
-    /// 1016, above the ceiling). Round-trip must accept the value.
+    /// `legacy_file_version = -9` is the UE 5.6+ marker. Below UE5
+    /// 1014, -9 introduces no new wire fields beyond what -8 emits
+    /// (they are gated by the UE5 version). Round-trip must accept the value.
     #[test]
     fn ue5_legacy_minus_nine_round_trip() {
         let mut s = minimal_ue4_27_summary();
@@ -1111,6 +1166,7 @@ mod tests {
         buf.extend_from_slice(&(-7i32).to_le_bytes()); // legacy
         buf.extend_from_slice(&(-1i32).to_le_bytes()); // ue3
         buf.extend_from_slice(&(503i32).to_le_bytes()); // file_version_ue4 < 504
+        buf.extend_from_slice(&(0i32).to_le_bytes()); // licensee (read before the gate)
         let err = PackageSummary::read_from(&mut Cursor::new(&buf), "x.uasset").unwrap_err();
         assert!(matches!(
             err,
@@ -1183,18 +1239,19 @@ mod tests {
         }
     }
 
-    /// The exact ceiling boundary (#643): 1014
-    /// (`METADATA_SERIALIZATION_OFFSET`, unread summary field) and
-    /// above are rejected with the version echoed back.
+    /// The exact ceiling boundary: `FIRST_UNSUPPORTED_UE5_VERSION`
+    /// (1018, first version past UE 5.6's 1017) and above are rejected
+    /// with the version echoed back.
     #[test]
     fn rejects_ue5_above_ceiling() {
-        for ue5 in [1014i32, 1015, 1016] {
+        for ue5 in [1018i32, 1019, 1020] {
             let mut buf = vec![];
             buf.extend_from_slice(&PACKAGE_FILE_TAG.to_le_bytes());
             buf.extend_from_slice(&(-8i32).to_le_bytes());
             buf.extend_from_slice(&(-1i32).to_le_bytes());
             buf.extend_from_slice(&(522i32).to_le_bytes()); // ue4
             buf.extend_from_slice(&ue5.to_le_bytes());
+            buf.extend_from_slice(&(0i32).to_le_bytes()); // licensee (read before the gate)
             let err = PackageSummary::read_from(&mut Cursor::new(&buf), "x.uasset").unwrap_err();
             assert!(
                 matches!(
